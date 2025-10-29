@@ -1,0 +1,19 @@
+name: tabpfn-gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.4
+  - scikit-learn
+  - numpy
+  - pandas
+  - scipy
+  - pip:
+      - tabpfn
+      - einops
+      - tqdm
