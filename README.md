@@ -9,7 +9,6 @@
 [![Torch](https://img.shields.io/badge/Torch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Conda](https://img.shields.io/badge/Conda-44A833?style=for-the-badge&logo=anaconda&logoColor=white)](https://docs.conda.io/)
 [![Quarto](https://img.shields.io/badge/Quarto-3D5A80?style=for-the-badge&logo=quarto&logoColor=white)](https://quarto.org/)
-[![RStudio](https://img.shields.io/badge/RStudio-75AADB?style=for-the-badge&logo=rstudio&logoColor=white)](https://posit.co/products/open-source/rstudio/)
 [![Positron](https://img.shields.io/badge/Positron-3C6E71?style=for-the-badge&logo=posit&logoColor=white)](https://posit.co/positron/)
 
 ## Rationale
