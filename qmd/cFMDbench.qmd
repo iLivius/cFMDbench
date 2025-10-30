@@ -1330,7 +1330,7 @@ if (selecting) {
     }
 ```
 
-#### Train models
+#### Train Learners
 
 ```{r classification, echo=FALSE, message=FALSE, warning=FALSE}
 # -----------------------------------------------------------------
