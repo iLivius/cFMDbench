@@ -48,6 +48,7 @@
   conda env create -f envs/tabpfn-gpu.yml
   ```
   - *Ensure reticulate uses this Conda environment when running tabpfn: `cFMDbench.qmd` reads the environment name and path from `~/.Renviron`, see [Configuration](#configuration), below.*
+  - *To run the latest model (November 2025), i.e. TabPFN-2.5, further effort is required. Please follow indications [here](https://huggingface.co/Prior-Labs/tabpfn_2_5).*
 
 ## Configuration
 
