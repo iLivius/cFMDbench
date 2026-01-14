@@ -1,9 +1,9 @@
 ---
-title: "cFMDbench: ML classification on metagenomic shotgun data with mlr3"
-subtitle: "Case study: cFMD v1.2.1 (curated Food Metagenomic Data)"
+title: "cFMDbench: ML classification of metagenomic shotgun data with mlr3"
+subtitle: "Case study: cFMD v1.3.0 (curated Food Metagenomic Data)"
 author: 
 - "Livio Antonielli"
-date: "2025/10/29"
+date: "2025/11/27"
 eeditor_options: 
   chunk_output_type: console
 format: html
@@ -24,10 +24,8 @@ setwd(WORKDIR)
 
 ```{r sourcing pkgs, echo=FALSE, message=FALSE, warning=FALSE}
 options(repos = c(CRAN = "https://cloud.r-project.org"))
-# 
-# =================
+
 # Method selection 
-# =================
 all_methods <- list(
   glmnet = "GLM elastic net",
   kknn = "K-Nearest Neighbor",
@@ -40,7 +38,8 @@ all_methods <- list(
   xgboost = "XGBoost"
 )
 
-pick_method <- c("ranger", "svm", "tabpfn", "xgboost")
+# pick_method <- c("mlp", "ranger", "svm", "xgboost")
+pick_method <- c("ranger", "xgboost")
 
 # resolve selection
 methods <- if (identical(pick_method, "all")) all_methods else {
@@ -59,9 +58,7 @@ if (needs_mlr3torch && needs_tabpfn) {
 
 cat("Methods selected:\n"); print(methods)
 
-# =================
 # Package sourcing 
-# =================
 is_installed <- function(pkg) pkg %in% rownames(installed.packages())
 
 # Install GitHub packages once
@@ -95,11 +92,18 @@ conflict_prefer("first", "dplyr")
 conflict_prefer("var", "compositions")
 conflict_prefer("progress", "httr")
 
-# =========================
 # Environment setup guard
-# =========================
 if (needs_tabpfn) {
-  # Use a Conda env with tabpfn (installed before)
+  
+  # Load HF token (so Python can access gated TabPFN models)
+  if (file.exists(".Renviron")) readRenviron(".Renviron")
+  token <- Sys.getenv("HF_TOKEN", unset = NA)
+  if (is.na(token) || token == "") {
+    stop("HF_TOKEN missing. Define it in .Renviron or system environment before running TabPFN.")
+  }
+  Sys.setenv(HF_TOKEN = token)  # ensure it is exported to Python
+
+  # Configure Conda / reticulate environment
   Sys.setenv(PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True")
   TABPFN_ENV_NAME <- Sys.getenv("TABPFN_ENV_NAME", unset = "tabpfn-gpu")
   TABPFN_CONDA_ROOT <- Sys.getenv("TABPFN_CONDA_ROOT", unset = Sys.getenv("CONDA_PREFIX"))
@@ -118,15 +122,13 @@ if (needs_tabpfn) {
       paste(names(chk)[!unlist(chk)], collapse = ", ")
     ))
   }
-  reticulate::py_config()  # prints the active Python; useful for logs
+  reticulate::py_config()
 }
 
 if (needs_mlr3torch) {
-  # Optional: install R-torch binaries once if not present
   if (!torch::torch_is_installed()) {
     message("Installing R torch backend..."); torch::install_torch()
   }
-  # Optional info
   if (!torch::cuda_is_available()) message("CUDA not available. R torch will use CPU.")
 }
 ```
@@ -134,12 +136,9 @@ if (needs_mlr3torch) {
 #### Set Parameters
 
 ```{r settings, echo=FALSE, message=FALSE, warning=FALSE}
-# =====================================
 # Set general parameters for execution
-# =====================================
 
 # Reduce verbosity of mlr3 logs
-# Uncomment the following lines to suppress warnings if needed
 lgr::get_logger("mlr3")$set_threshold("off")
 lgr::get_logger("bbotk")$set_threshold("off")
 # lgr::get_logger("mlr3")$set_threshold("error")
@@ -204,7 +203,7 @@ learner_fallback = FALSE
 
 # Dataset ID and version
 ds = "cFMD"
-ver = "v1.2.1"
+ver = "v1.3.0"
 
 # Define a variable to use as target. Use either category, type, or subtype.
 target <- "category"
@@ -234,9 +233,7 @@ manifest <- if (file.exists(manifest_path)) readRDS(manifest_path) else list()
 #### Import Data
 
 ```{r import, echo=FALSE, message=FALSE, warning=FALSE}
-# ---------------
-# Helpers
-# ---------------
+# Define a download helper
 get_projects <- function(base_url) {
   resp <- GET(base_url, add_headers(Authorization = paste("token", GITHUB_TOKEN)))
   stop_for_status(resp)
@@ -244,7 +241,7 @@ get_projects <- function(base_url) {
   vapply(cont, function(x) x$name, character(1))
 }
 
-# Download only if sha changed; otherwise read from disk
+# Download only if sha changed, otherwise read from disk
 read_profile_cached <- function(project) {
   file_path <- sprintf("cFMD_data/%s/%s_taxonomic_profiles.tsv", project, project)
   api_url   <- paste0("https://api.github.com/repos/SegataLab/cFMD/contents/", file_path)
@@ -284,7 +281,7 @@ read_profile_cached <- function(project) {
 
   # robust read
   df <- tryCatch({
-    read_tsv(local_tsv, col_types = cols(), show_col_types = FALSE) |> rename(Taxon = 1)
+    read_tsv(local_tsv, col_types = cols(), show_col_types = FALSE) %>% rename(Taxon = 1)
   }, error = function(e) {
     message("Failed to parse: ", project, " - ", e$message)
     NULL
@@ -292,9 +289,7 @@ read_profile_cached <- function(project) {
   df
 }
 
-# --------------------
 # Load and Merge Data
-# --------------------
 closeAllConnections()
 projects <- get_projects(base_url)
 
@@ -304,7 +299,7 @@ profile_list <- list()
 
 for (batch in batches) {
   message("Processing batch: ", paste(batch, collapse = ", "))
-  batch_profiles <- map(batch, read_profile_cached) |> compact()
+  batch_profiles <- map(batch, read_profile_cached) %>% compact()
   profile_list <- c(profile_list, batch_profiles)
   Sys.sleep(2)  # gentle on API
   closeAllConnections()
@@ -317,13 +312,11 @@ if (length(profile_list) == 0) stop("No profiles loaded.")
 merged_profiles <- reduce(profile_list, full_join, by = "Taxon")
 message("Merged to ", nrow(merged_profiles), " rows × ", ncol(merged_profiles), " cols.")
 
-# ---------------------------------
-# Filter by Completeness Threshold
-# ---------------------------------
+# Filter by Completeness threshold
 
-# Separate metadata (first 6 rows) and taxonomic data
-metadata <- merged_profiles[1:6, ]
-taxa_only <- merged_profiles[-(1:6), ]
+# Separate metadata (first 7 rows) and taxonomic data
+metadata <- merged_profiles[1:7, ]
+taxa_only <- merged_profiles[-(1:7), ]
 
 # Convert to numeric (excluding 'Taxon')
 taxa_only[-1] <- lapply(taxa_only[-1], as.numeric)
@@ -354,15 +347,33 @@ transposed_matrix <- t(filtered_profiles[-1])
 transposed_df <- as.data.frame(transposed_matrix)
 colnames(transposed_df) <- filtered_profiles$Taxon
 
-# Add sample names as a column
-tab_raw <- rownames_to_column(transposed_df, var = "Sample")
+# Convert taxonomic abundances to numeric 
+transposed_df %<>%
+  mutate(
+    across(
+      .cols = -c(1:7),
+      .fns = ~ suppressWarnings(as.numeric(.x))
+    )
+  )
 
-# -----------------
+# Re-order the levels in each categorical factor 
+reorder_factor <- function(x) {
+  if (is.character(x) || is.factor(x)) {
+    factor(x, levels = sort(unique(x)))
+  } else {
+    x
+  }
+}
+
+tab_raw <- transposed_df %>%
+  mutate(
+    across(where(~ is.character(.x) || is.factor(.x)), reorder_factor)
+  )
+
 # Plot bad samples
-# -----------------
 
 # Filter taxonomic rows (i.e., drop metadata rows)
-taxa_only <- merged_profiles[-(1:6), ]
+taxa_only <- merged_profiles[-(1:7), ]
 
 # Convert all columns except 'Taxon' to numeric
 taxa_only[-1] <- lapply(taxa_only[-1], as.numeric)
@@ -382,17 +393,17 @@ project_names <- sapply(strsplit(bad_samples, "__"), `[`, 1)
 
 # Create a data frame for plotting
 bad_df <- data.frame(
-  Sample = bad_samples,
+  sample = bad_samples,
   Sum = bad_sums,
   Project = project_names
 )
 
 # Make a plot of samples with completeness below defined threshold
 if (nrow(bad_df) > 0) {
-  p <- ggplot(bad_df, aes(x = Sum, y = reorder(Sample, Sum), text = paste("Project:", Project))) +
+  p <- ggplot(bad_df, aes(x = Sum, y = reorder(sample, Sum), text = paste("Project:", Project))) +
     geom_bar(stat = "identity") +
     facet_wrap(~ Project, scales = "free_y") +
-    labs(x = "Sum", y = "Sample") +
+    labs(x = "Sum", y = "sample") +
     theme_minimal()
   
   ggplotly(p, tooltip = "text")
@@ -537,21 +548,25 @@ wordcloud(
 #### Pre-Process I
 
 ```{r pre-process, echo = FALSE, message = FALSE, warning = FALSE}
-# Convert character columns as factors and keep only microbial variables and target factor
-tab <- tab_raw %>% mutate(across(starts_with("k__"), as.numeric)) %>% 
-  mutate(across(where(is_character), as_factor)) %>% 
-  select(Sample, !!as.symbol(target), starts_with("k__"))
+# Convert to correct types and keep sample + target + microbial features
+tab <- tab_raw %>% 
+  mutate(across(starts_with("k__"), as.numeric)) %>% 
+  mutate(
+    !!as.symbol(target) := factor(
+      !!as.symbol(target),
+      levels = sort(unique(!!as.symbol(target)))
+    )
+  ) %>% 
+  select(sample, !!as.symbol(target), starts_with("k__"))
 
-# Rename the target column as "target"
+# Rename target column
 names(tab)[names(tab) == target] <- "target"
 
-# Remove rows corresponding to classes with min_samples_per_class observations
-tab %<>%
+# Filter classes by minimum sample size
+tab <- tab %>%
   group_by(target) %>%
   mutate(n = n()) %>%
-  # Drop any class smaller than your minimum threshold
   filter(n >= min_samples_per_class) %>%
-  # From each class, keep only the desired fraction of rows
   slice_sample(prop = samples_to_keep) %>%
   ungroup() %>%
   select(-n) %>%
@@ -596,13 +611,13 @@ tab %<>% sample_frac(size = 1)
 #### Visualize Data II
 
 ```{r inspecting data, echo = FALSE, message = FALSE, warning = FALSE}
-df <- as_tibble(tab)
+df <- as_tibble(tab) %>% mutate(target = str_replace_all(target, "_", " "))
 
-# a) pick taxa columns
+# Pick taxa columns
 taxa_cols <- setdiff(names(df), "target")
 old_names <- taxa_cols
 
-# b) shorten: prefer species tail; else genus tail; else keep
+# Shorten: prefer species tail, else genus tail, else keep
 shorten_one <- function(n){
   if (grepl("s__", n)) return(sub(".*(s__.*)$", "\\1", n))
   if (grepl("g__", n)) return(sub(".*(g__.*)$", "\\1", n))
@@ -610,14 +625,14 @@ shorten_one <- function(n){
 }
 new_names <- vapply(taxa_cols, shorten_one, character(1))
 
-# c) ensure uniqueness
+# Ensure uniqueness
 new_names <- make.unique(new_names, sep = "_")
 
-# d) apply to df
+# Apply to df
 names(df)[match(taxa_cols, names(df))] <- new_names
 
 y  <- df$target
-X <- df[ , !(names(df) %in% c("target", "Sample"))]
+X <- df[ , !(names(df) %in% c("target", "sample"))]
 
 # Optional downsample (keep y aligned)
 if (nrow(X) > 10000) {
@@ -626,41 +641,23 @@ if (nrow(X) > 10000) {
   y <- y[idx]
 }
 
-# a) pick taxa columns
-taxa_cols <- setdiff(names(df), "target")
-old_names <- taxa_cols
-
-# b) shorten: prefer species tail; else genus tail; else keep
-shorten_one <- function(n){
-  if (grepl("s__", n)) return(sub(".*(s__.*)$", "\\1", n))
-  if (grepl("g__", n)) return(sub(".*(g__.*)$", "\\1", n))
-  n
-}
-new_names <- vapply(taxa_cols, shorten_one, character(1))
-
-# c) ensure uniqueness
-new_names <- make.unique(new_names, sep = "_")
-
-# d) apply to df
-names(df)[match(taxa_cols, names(df))] <- new_names
-
-# 1) Prevalence filter and zero-variance guard
+# Prevalence filter and zero-variance guard
 prev <- colMeans(X > 0)
 X <- X[, prev >= 0.05, drop = FALSE] # keep taxa present in ≥5% samples
 if (ncol(X) == 0) stop("All features filtered out; lower the prevalence threshold.")
 X <- X[, apply(X, 2, var) > 0, drop = FALSE]
 
-# 2) Zero replacement WITHOUT deletions
+# Zero replacement WITHOUT deletions
 X0 <- zCompositions::cmultRepl(as.matrix(X),
                                label = 0,
                                method = "CZM",
                                z.warning = 1, # silence high-zero warnings
                                z.delete  = FALSE) # do not drop rows/cols
 
-# 3) CLR transform
+# CLR transform
 X_clr <- compositions::clr(X0)
 
-# -------- PCA (on CLR) --------
+# PCA (on CLR)
 pca <- prcomp(X_clr, scale. = TRUE)
 
 # Scree plot of PCA variance
@@ -671,7 +668,7 @@ scores <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], target = y)
 
 ggplot(scores, aes(PC1, PC2, fill = target)) +
   geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
-  scale_fill_viridis_d(name = "target") +
+  scale_fill_viridis_d(option = "turbo", name = "target") +
   theme_bw() +
   labs(title = "PCA on CLR-transformed abundances",
        x = paste0("PC1 (", round(100*summary(pca)$importance[2,1], 1), "%)"),
@@ -698,7 +695,7 @@ elbow_df <-
     Cumulative_Proportion_Var_Explained = cumulative_prop_var
   )
 
-# Plot the elbow plot
+# Elbow plot
 ggplot(elbow_df,
        aes(x = Num_Components, y = Cumulative_Proportion_Var_Explained)) +
   geom_line() +
@@ -732,39 +729,54 @@ for (i in 1:ncol(loadings)) {
       "\n")
 }
 
-# -------- t-SNE (on CLR) --------
+# t-SNE (on CLR abundances)
 perplexity <- pmin(30, floor((nrow(X_clr) - 1) / 3))  # safe, within 5–30 typical
-ts <- Rtsne(X_clr,
-            pca = FALSE,
-            check_duplicates = FALSE,
-            perplexity = perplexity,
-            theta = 0.5)
+ts <- Rtsne(
+  X_clr,
+  pca = TRUE,
+  check_duplicates = FALSE,
+  perplexity = perplexity,
+  theta = 0.5,
+  num_threads = 8
+)
 
 ts_df <- data.frame(tSNE1 = ts$Y[,1], tSNE2 = ts$Y[,2], target = y)
 
 ggplot(ts_df, aes(tSNE1, tSNE2, fill = target)) +
-  geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
-  scale_fill_viridis_d(name = "target") +
+  geom_point(
+    shape = 21,
+    size = 5,
+    colour = "white",
+    stroke = 0.8
+  ) +
+  scale_fill_viridis_d(option = "turbo", name = "target") +
   theme_bw() +
-  labs(title = "t-SNE on CLR-transformed abundances")
+  labs(title = "t-SNE on CLR-transformed abundances") +
+  theme(
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
 ```
 
 #### Define Task
 
 ```{r task, echo=FALSE, message=FALSE, warning=FALSE}
-# =======================================================
 # Split dataset into training and test sets
-# =======================================================
 
-# build task with a stable primary key and remove it from features
-stopifnot("Sample" %in% names(tab), !anyDuplicated(tab$Sample))
+# Build task with a stable primary key and remove it from features
+stopifnot("sample" %in% names(tab), !anyDuplicated(tab$sample))
 backend <- mlr3::as_data_backend(tab, primary_key = seq_len(nrow(tab)))  # integer
 task <- mlr3::as_task_classif(backend, target = "target")
 
-# keep Sample for reference, but not as a feature
-task$set_col_roles("Sample", roles = character())
+# Keep sample for reference, but not as a feature
+task$set_col_roles("sample", roles = character())
 
-# split by row_ids
+# Split by row_ids
 split <- partition(task, ratio = 0.8)
 task_train <- task$clone(deep = TRUE)$filter(split$train)
 task_test  <- task$clone(deep = TRUE)$filter(split$test)
@@ -785,10 +797,7 @@ task_test$set_col_roles("target", c("target", "stratum"))
 #### Pre-Process II
 
 ```{r preprocess, echo=FALSE, message=FALSE, warning=FALSE}
-# ================================
 # Analyze Class Distribution
-# ================================
-
 class_counts <- table(task_train$data()$target)
 majority_class <- names(which.max(class_counts))
 minority_class <- names(which.min(class_counts))
@@ -801,19 +810,15 @@ cat("\nMajority Class:", majority_class, "with", class_counts[majority_class], "
 cat("Minority Class:", minority_class, "with", class_counts[minority_class], "instances\n")
 cat("Imbalance Ratio:", round(imbalance_ratio, 2), ":", "1\n")
 
-# ================================
-# Plot Class Distribution
-# ================================
-
 # Create dataframe for plotting
 class_counts_df <- as.data.frame(class_counts)
 colnames(class_counts_df) <- c("target", "count")
 
 # Plot class distribution
-ggplot(class_counts_df, aes(x = target, y = count, fill = target)) +
+ggplot(class_counts_df, aes(x = reorder(target, count, decreasing = TRUE), y = count, fill = target)) +
   geom_bar(stat = "identity", width = 0.6, show.legend = FALSE) +  
   geom_text(aes(label = count), vjust = -0.5, size = 5, fontface = "bold") +  
-  # scale_fill_manual(values = c("steelblue", "orange", "firebrick", "forestgreen", 'purple', 'deepskyblue')) +  
+  scale_fill_viridis_d(option = "turbo", name = "target") + 
   theme_minimal(base_size = 14) +
   labs(
     title = "Class Distribution",
@@ -825,11 +830,8 @@ ggplot(class_counts_df, aes(x = target, y = count, fill = target)) +
     axis.text.x = element_text(angle = 45, hjust = 1)
   )
 
-# ================================
 # Setup SMOTE Parameters
-# ================================
-
-min_samples_per_class <- 5   # Minimum required samples per class for SMOTE
+min_samples_per_class <- min_samples_per_class  # Minimum required samples per class for SMOTE
 imbalance_threshold <- 1.5    # Only apply SMOTE if imbalance exceeds this
 
 # Check if dataset qualifies for SMOTE
@@ -856,11 +858,7 @@ if (smote != "none" && !apply_smote) {
 # Initialize SMOTE pipeline as NULL
 smote_pipe <- NULL
 
-# ================================
 # Build Preprocessing Pipeline
-# ================================
-
-# --- Build Preprocessing Pipeline ---
 preprocessing_pipe <- NULL
 
 if (selecting) filtering = "minimal"
@@ -886,7 +884,7 @@ if (filtering != FALSE) {
   preprocessing_pipe <- preprocessing_pipe %>>% po("scale", center = TRUE)
 }
 
-# SMOTE pipe (if needed)
+# Build a SMOTE pipe
 smote_pipe <- NULL
 if (apply_smote && smote %in% c("smote", "blsmote", "adasyn")) {
   smote_pipe <- switch(smote,
@@ -901,7 +899,7 @@ if (!is.null(smote_pipe)) {
   preprocessing_pipe <- preprocessing_pipe %>>% smote_pipe
 }
 
-# --- Remove lazy_tensor from ALL PipeOps ---
+# Remove lazy_tensor from ALL PipeOps
 for (po_name in names(preprocessing_pipe$pipeops)) {
   po <- preprocessing_pipe$pipeops[[po_name]]
   if (!is.null(po$.__enclos_env__$private$.feature_types)) {
@@ -918,8 +916,7 @@ for (po_name in names(preprocessing_pipe$pipeops)) {
 cat("\nFinal preprocessing pipeline:\n")
 print(preprocessing_pipe)
 
-# --- Preprocessing parameter search space ---
-
+# Preprocessing parameter search space
 preproc_params <- list()
 
 if (filtering == "varcor") {
@@ -965,7 +962,7 @@ future::plan(multisession, workers = num_jobs)
 
 # Go FS or EFS
 num_col = 100
-num_row = 100 #choose a small value to force FS: EFS is computationally demanding
+num_row = 100 #choose a small value to force a simple FS: ensemble FS is computationally demanding
 
 if (selecting) {
   # Set minimum number of features to keep
@@ -974,7 +971,7 @@ if (selecting) {
   } else {
     n_features = 10
   }
-  # Set Feature Selection (FS) method
+  # Set FS method
   if (task_train$nrow > num_row) {
     fs_method = "simple"
   } else {
@@ -1023,10 +1020,10 @@ if (selecting) {
   learners = list(fs_rpart, fs_ranger, fs_svm, fs_xgboost)
   
   # callbacks = list(
-  #     xgboost  = list(one_se_clbk, xgb_clbk),
+  #     xgboost = list(one_se_clbk, xgb_clbk),
   #     rpart = list(one_se_clbk),
-  #     rf   = list(one_se_clbk),
-  #     svm  = list(one_se_clbk, svm_rfe)
+  #     rf = list(one_se_clbk),
+  #     svm = list(one_se_clbk, svm_rfe)
   #   )
   
   # Generate a pre-processing pipeline
@@ -1064,10 +1061,16 @@ if (selecting) {
     print(efs)
     head(efs$result)
     
-    # Visualization
-    print(autoplot(efs, type = "performance", theme = theme_minimal(base_size = 14))) #performance scores of the different learners
-    print(autoplot(efs, type = "n_features", theme = theme_minimal(base_size = 14))) #number of features selected by each learner
-    print(autoplot(efs, type = "pareto", theme = theme_minimal(base_size = 14))) #Pareto: trade-off between number of features and performance
+    # Performance scores of different learners
+    print(autoplot(efs, type = "performance", theme = theme_minimal(base_size = 14)))
+    
+    # Number of features selected by each learner
+    print(autoplot(efs, type = "n_features", theme = theme_minimal(base_size = 14)))
+    
+    # Pareto: trade-off between number of features and performance
+    print(autoplot(efs, type = "pareto", theme = theme_minimal(base_size = 14)))
+    
+    # Estimated Pareto front curve by fitting a linear model with the inverse of the number of selected features
     print(
       autoplot(
         efs,
@@ -1075,7 +1078,7 @@ if (selecting) {
         pareto_front = "estimated",
         theme = theme_minimal(base_size = 14)
       ) + scale_color_brewer(palette = "Set1") + labs(title = "Estimated Pareto front")
-    ) #estimated Pareto front curve by fitting a linear model with the inverse of the number of selected features
+    )
     
     # Identify knee points for feature cutoffs
     kp = efs$knee_points(type = "estimated")
@@ -1089,11 +1092,11 @@ if (selecting) {
       message("Estimated knee point: ", n_feat, " features")
     }
     
-    # Assess feature selection stability
-    global_stab = efs$stability("jaccard", global = TRUE) #assess the stability across all resampling iterations and learners
+    # Assess feature selection stability, across all resampling iterations and learners
+    global_stab = efs$stability("jaccard", global = TRUE) #assess the stability
     message("Global stability (Jaccard): ", global_stab)
     per_learner_stab = efs$stability("jaccard", global = FALSE) #or per each learner separately
-    print(per_learner_stab) #Jaccard index -> the higher the better
+    print(per_learner_stab) #Jaccard index: the higher the better
     autoplot(efs, type = "stability", theme = theme_minimal(base_size = 14)) + scale_fill_brewer(palette = "Set1") #
     
     # Generate consensus feature ranking based on chosen cutoff, based on approval voting method
@@ -1135,7 +1138,7 @@ if (selecting) {
 
 ```{r final look, echo = FALSE, message = FALSE, warning = FALSE}
 if (selecting) {
-  df <- as_tibble(task_train$data())
+  df <- as_tibble(task_train$data()) %>% mutate(target = str_replace_all(target, "_", " "))
   
   # a) pick taxa columns
   taxa_cols <- setdiff(names(df), "target")
@@ -1158,7 +1161,7 @@ if (selecting) {
   names(df)[match(taxa_cols, names(df))] <- new_names
   
   y  <- df$target
-  X <- df[, !(names(df) %in% c("target", "Sample"))]
+  X <- df[, !(names(df) %in% c("target", "sample"))]
   
   # Optional downsample (keep y aligned)
   if (nrow(X) > 10000) {
@@ -1187,14 +1190,14 @@ if (selecting) {
   # d) apply to df
   names(df)[match(taxa_cols, names(df))] <- new_names
   
-  # 1) Prevalence filter and zero-variance guard (you control this, no silent row drops)
+  # 1) Prevalence filter and zero-variance guard
   prev <- colMeans(X > 0)
-  X <- X[, prev >= 0.05, drop = FALSE]                 # keep taxa present in ≥5% samples
+  X <- X[, prev >= 0.05, drop = FALSE] # keep taxa present in ≥5% samples
   if (ncol(X) == 0)
     stop("All features filtered out; lower the prevalence threshold.")
   X <- X[, apply(X, 2, var) > 0, drop = FALSE]
   
-  # 2) Zero replacement WITHOUT deletions
+  # 2) Zero replacement without deletions
   X0 <- zCompositions::cmultRepl(
     as.matrix(X),
     label = 0,
@@ -1207,7 +1210,7 @@ if (selecting) {
   # 3) CLR transform
   X_clr <- compositions::clr(X0)
   
-  # -------- PCA (on CLR) --------
+  # PCA (on CLR)
   pca <- prcomp(X_clr, scale. = TRUE)
   
   # Scree plot of PCA variance
@@ -1301,14 +1304,15 @@ if (selecting) {
         "\n")
   }
   
-  # -------- t-SNE (on CLR) --------
+  # t-SNE (on CLR)
   perplexity <- pmin(30, floor((nrow(X_clr) - 1) / 3))  # safe, within 5–30 typical
   ts <- Rtsne(
     X_clr,
-    pca = FALSE,
+    pca = TRUE,
     check_duplicates = FALSE,
     perplexity = perplexity,
-    theta = 0.5
+    theta = 0.5,
+    num_threads = 8 
   )
   
   ts_df <- data.frame(tSNE1 = ts$Y[, 1],
@@ -1325,17 +1329,24 @@ if (selecting) {
       ) +
       scale_fill_viridis_d(option = "turbo", name = "target") +
       theme_bw() +
-      labs(title = "t-SNE on CLR-transformed abundances")
+      labs(title = "t-SNE on CLR-transformed abundances") +
+      theme(
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        plot.title = element_text(size = 18),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 14)
+      )
   )
-    }
+}
 ```
 
-#### Train Learners
+#### Train models
 
 ```{r classification, echo=FALSE, message=FALSE, warning=FALSE}
-# -----------------------------------------------------------------
 # Tune model hyperparameters via inner cross-validation resampling 
-# -----------------------------------------------------------------
 
 # Reset computation to sequential
 future::plan(sequential)
@@ -1433,7 +1444,7 @@ for (i in seq_along(methods)) {
   if (num_feat < 25 || num_obs < 500)
     fast_tuning = FALSE
 
-  # === Build learner + search_space ===
+  # Build learner + search_space
   if (fast_tuning && method %in% c("glmnet", "kknn", "naive_bayes", "svm")) {
     learner_pipe <- preprocessing_pipe %>>% po("subsample") %>>% base_learner
   } else if (fast_tuning && method == "lda") {
@@ -1445,7 +1456,7 @@ for (i in seq_along(methods)) {
   }
   final_learner <- as_learner(learner_pipe)
   
-  # Define search_space with pipeline-qualified parameter names
+  # Define search_space
   if (fast_tuning) {
     if (method == "glmnet") {
       learner_params = list(
@@ -1746,10 +1757,6 @@ for (i in seq_along(methods)) {
 #### Benchmark
 
 ```{r benchmarking, echo = FALSE, message = FALSE, warning = FALSE}
-  # ================================
-# Evaluation Measure and Utilities
-# ================================
-
 # Define measure used for plotting and evaluation
 measure = c('accuracy' = "classif.acc")
 
@@ -1820,9 +1827,7 @@ get_final_preproc_summary <- function(graph_learner, after = smote) {
   )
 }
 
-# ==================
 # Benchmarking Setup
-# ==================
 
 # Reset computation to sequential
 future::plan(sequential)
@@ -1902,10 +1907,7 @@ for (method in names(learners_best)) {
   }
 }
 
-# =============================
-# Run Benchmark and Report Time
-# =============================
-
+# Run benchmark and report time
 start_time <- Sys.time()
 cat(" Start time: ", format(start_time, "%Y-%m-%d %H:%M:%S"), "\n")
 
@@ -1923,10 +1925,7 @@ if (time_diff < 60) {
   cat(" Time taken for benchmarking: ", time_diff, " minutes\n")
 }
 
-# ================================
-# Plot Model Performance (Boxplot)
-# ================================
-
+# Plot model performance
 autoplot(bmr, measure = msr(measure[[1]])) +
   labs(x = "Method", y = paste(names(measure[1]), "measure")) +
   scale_x_discrete(labels = as.character(unlist(methods))) +
@@ -1941,10 +1940,7 @@ autoplot(bmr, measure = msr(measure[[1]])) +
     legend.title = element_text(size = 14)
   )
 
-# =====================================
-# Summarize Benchmark Results (Barplot)
-# =====================================
-
+# Summarize benchmark results
 bench_df <- as.data.frame(bmr$aggregate(measures = lapply(bmr_measures, msr)))
 
 bench_df %<>%
@@ -2010,10 +2006,7 @@ ggplot(bench_long, aes(x = method, y = value, fill = measure)) +
     legend.title = element_text(size = 14)
   )
 
-# =============================
-# Identify Best Model by Metric
-# =============================
-
+# Identify best model: balanced accuracy and logloss
 best_row <- bench_df %>%
   arrange(desc(`balanced accuracy`), logloss) %>%
   slice(1)
@@ -2021,15 +2014,13 @@ best_row <- bench_df %>%
 best_model_id <- best_row$learner_id
 best_method <- best_row$method
 
-# =============================
-# Average Fold-Wise Predictions
-# =============================
+# Average fold-wise predictions
 
 # Extract prediction objects for best model
 pred_dt <- as.data.table(bmr$score())
 best_preds <- pred_dt[str_detect(learner_id, best_model_id)]
 
-# Flatten PredictionClassif objects into one tibble
+# Flatten predictionClassif objects into one tibble
 all_preds <- best_preds$prediction_test %>%
   map_dfr(~ as.data.table(.x) %>% as_tibble())
 
@@ -2067,10 +2058,7 @@ if (length(prob_cols) == 2) {
     )
 }
 
-# =========================
-# Final Class-Level Summary
-# =========================
-
+# Final class-Level summary
 class_errors <- avg_preds %>%
   group_by(truth) %>%
   summarise(
@@ -2080,10 +2068,7 @@ class_errors <- avg_preds %>%
     .groups = "drop"
   )
 
-# ========================
-# Plot Prediction Overview
-# ========================
-
+# Plot prediction overview
 pred_summary <- avg_preds %>%
   group_by(truth, correct) %>%
   summarise(N = n(), .groups = "drop") %>%
@@ -2144,7 +2129,6 @@ p3 <- ggplot(avg_preds, aes(x = truth, y = response, color = correct)) +
     title = paste("Prediction Overview –", best_method),
     theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
   )
-
 ```
 
 #### Prediction
@@ -2210,7 +2194,6 @@ gather_pred_performance <- function(env = .GlobalEnv) {
     x
   })
 
-    
   # Merge all into a single data.frame
   pred_df <- bind_rows(pred_list)
   
@@ -2305,17 +2288,39 @@ plot_df <- pred_tabs %>%
 
 ggplot(plot_df, aes(x = truth, y = pct, fill = match)) +
   geom_col(width = 0.9) +
-  geom_text(aes(label = label), position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    color = "white",
+    size = 3
+  ) +
   facet_grid(method ~ ., scales = "free_x", space = "free_x") +
-  scale_fill_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3"), name = "Correct") +
+  scale_fill_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3"),
+                    name = "Correct") +
   scale_y_continuous(labels = percent_format(scale = 1), expand = expansion(mult = c(0, 0.05))) +
   labs(x = "Class", y = "Percent of predictions", title = "Test predictions by class and method") +
   theme_bw() +
   theme(
+    axis.text.x = element_text(
+      size = 14,
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
     strip.text.y = element_text(angle = 0),
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    panel.grid.major.x = element_blank()
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(size = 18),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
   )
+
+  # theme(
+  #   strip.text.y = element_text(angle = 0),
+  #   axis.text.x = element_text(angle = 45, hjust = 1),
+  #   panel.grid.major.x = element_blank()
+  # )
 
 ```
 
@@ -2370,7 +2375,7 @@ ggplot(dumbbell_df, aes(y = method, group = metric)) +
   scale_color_manual(values = c(Train = "green3", Test = "magenta3")) +
   theme_minimal(base_size = 16) +
   theme(plot.title = element_text(face = "bold", hjust = 0.5),
-        axis.text.x = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
         panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.6),
         panel.spacing.x = unit(1.2, "lines"),
         legend.position = "right")
@@ -2379,62 +2384,207 @@ ggplot(dumbbell_df, aes(y = method, group = metric)) +
 #### Feature importance
 
 ```{r importance, echo = FALSE, message = FALSE, warning = FALSE}
-method = best_model_id
+# Use the best accuracy model
+method <- best_model_id
+n_samples_shap <- 100 #for speed
+n_features <- 10  #top features to show
 
-# Define the function to parse taxon names
+# Taxon name simplifier
 parse_taxon_name <- function(name) {
-  parsed_name <- str_extract(name, "(?<=_s__).*")
-  parsed_name <- str_replace_all(parsed_name, "_t__", "_")
-  return(parsed_name)
+  parsed_name <- stringr::str_extract(name, "(?<=_s__).*")
+  parsed_name <- stringr::str_replace_all(parsed_name, "_t__", "_")
+  parsed_name
 }
 
-if (target %in% c("category", "type")) {
-  # Create a mapping between original and simplified names
-  temp_tab <- task_train$data() %>% select(-target) %>% as.data.frame()
-  temp_targ <- task_train$data()$target
-  original_names <- colnames(temp_tab)
-  simplified_names <- sapply(original_names, parse_taxon_name)
+# Extract training data
+temp_dat  <- task_train$data()
+temp_tab  <- temp_dat %>% dplyr::select(-target) %>% as.data.frame()
+temp_targ <- task_train$data()$target
+
+# Simplify feature names
+original_names   <- colnames(temp_tab)
+simplified_names <- vapply(original_names, parse_taxon_name, FUN.VALUE = character(1))
+name_mapping     <- setNames(simplified_names, original_names)
+
+# Get the tuned learner
+imodel <- get(paste(method, "tuned", "learner", sep = "_"))
+
+# iml Predictor
+temp_pred <- Predictor$new(
+  model = imodel,
+  data  = temp_tab,
+  y     = temp_targ,
+  type  = "prob"
+)
+
+# Parallel plan (optional)
+future::plan(sequential)
+if (!method %in% c("mlp", "tabpfn"))
+  future::plan(future::multisession, workers = num_threads)
+
+# SHAP importance
+
+# Subsample samples
+n_samples_shap <- min(n_samples_shap, nrow(temp_tab))
+idx <- sample.int(nrow(temp_tab), n_samples_shap)
+temp_tab_small <- temp_tab[idx, , drop = FALSE]
+
+# Compute SHAP for the selected samples
+shap_list <- lapply(seq_len(nrow(temp_tab_small)), function(i) {
+  s <- Shapley$new(temp_pred, x.interest = temp_tab_small[i, , drop = FALSE])
+  s$results %>% dplyr::mutate(sample_id = idx[i])
+})
+
+shap_all <- dplyr::bind_rows(shap_list)
+
+# Global SHAP importance (mean |phi|) + top-N
+shap_agg <- shap_all %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(mean_abs_phi = mean(abs(phi)), .groups = "drop") %>%
+  dplyr::mutate(feature_pretty = dplyr::recode(feature, !!!name_mapping)) %>%
+  dplyr::arrange(desc(mean_abs_phi)) %>%
+  dplyr::slice_head(n = n_features)
+
+# Plot 1: global SHAP importance
+plot_global <- ggplot(shap_agg, aes(x = reorder(feature_pretty, mean_abs_phi), y = mean_abs_phi)) +
+  geom_col(fill = "royalblue3") +
+  coord_flip() +
+  labs(
+    title    = paste("Top", n_features, "features by mean SHAP"),
+    subtitle = paste(n_samples_shap, "samples used"),
+    x        = "Feature (taxon)",
+    y        = "Mean SHAP"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
+
+print(plot_global)
+
+# Class-specific SHAP (direction)
+class_contrib <- shap_all %>%
+  dplyr::group_by(feature, class) %>%
+  dplyr::summarise(
+    mean_phi     = mean(phi),
+    mean_abs_phi = mean(abs(phi)),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(feature_pretty = dplyr::recode(feature, !!!name_mapping)) %>%
+  dplyr::mutate(class = str_replace_all(class, "_", " "))
+
+# Keep only the top-N features
+class_contrib_top <- class_contrib %>%
+  dplyr::filter(feature %in% shap_agg$feature)
+
+classes <- sort(unique(class_contrib$class))
+
+if (length(classes) == 2L) {
+  ref <- classes[1]
+  oth <- classes[2]
   
-  name_mapping <- setNames(simplified_names, original_names)
-  
-  # Get the model
-  imodel <- get(paste(method, "tuned", "learner", sep = "_"))
-  # Build R6 object on selected training model
-  temp_pred = Predictor$new(model = imodel, data = temp_tab, y = temp_targ, type = "prob")
-  
-  # Calculate feature importance
-  future::plan(sequential)
-  if (!method %in% c("mlp", "tabpfn")) {
-  future::plan(future::multisession, workers = num_threads)  
-  }
-  feat_imp = FeatureImp$new(temp_pred, loss = "ce", n.repetitions = 10, compare = "difference")
-  
-  # Get feature importance results
-  feat_imp_results <- feat_imp$results
-  
-  # Modify the feature importance results to use simplified names
-  feat_imp_results$feature <- name_mapping[feat_imp_results$feature]
-  
-  # Remove any NA values resulting from unmatched names
-  feat_imp_results <- feat_imp_results[!is.na(feat_imp_results$feature), ]
-  
-  # Select top 25 most important features
-  feat_imp_top25 <- feat_imp_results[1:25, ]
-  
-  # Create the ggplot2 plot
-  feat_imp_plot <- ggplot(feat_imp_top25, aes(x = reorder(feature, importance), y = importance)) +
-    geom_bar(stat = "identity", fill = "mediumseagreen") +
-    geom_errorbar(aes(ymin = importance.05, ymax = importance.95), width = 0.4) +
+  class_plot <- class_contrib_top %>%
+    dplyr::filter(class == ref) %>%
+    ggplot(aes(
+      x = reorder(feature_pretty, mean_phi),
+      y = mean_phi,
+      fill = mean_phi > 0
+    )) +
+    geom_col() +
+    scale_fill_manual(
+      values = c("TRUE" = "#1f78b4", "FALSE" = "#e31a1c"),
+      labels = c("Decreases P(ref)", "Increases P(ref)")
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
     coord_flip() +
-    labs(title = paste("Feature importance of", methods[[method]], "model", sep = " "), x = "Feature", y = "Importance (cross entropy loss)") +
+    labs(
+      title = paste("Class-specific SHAP (Reference:", ref, ")"),
+      subtitle = paste(n_samples_shap, "samples and", n_features, "features used"),
+      x = "Feature (Simplified species name)",
+      y = paste("Mean SHAP for", ref),
+      fill = "Effect direction"
+    ) +
     theme_minimal() +
     theme(
-      axis.text.y = element_text(size = 10),
-      plot.title = element_text(size = 14, face = "bold"),
-      axis.title = element_text(size = 12)
-    )
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14)
+  )
   
-  # Print the modified plot
-  print(feat_imp_plot)
+  print(class_plot)
+  
+} else {
+  # Multiclass case
+  # Determine a valid x position (top feature after reorder)
+  x_pos <- shap_agg$feature_pretty[1]
+  
+  class_plot <- ggplot(class_contrib_top, aes(
+    x = reorder(feature_pretty, mean_abs_phi),
+    y = mean_phi,
+    fill = class
+  )) +
+    scale_fill_viridis_d(option = "turbo", name = "target") +
+    geom_col(position = "dodge") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    coord_flip() +
+    labs(
+      title = paste("Class-specific SHAP contributions"),
+      subtitle = paste(n_samples_shap, "samples and", n_features, "features used"),
+      x = "Feature (taxon)",
+      y = "Mean SHAP value (left = decreases P(class), right = increases P(class))"
+    ) +
+    
+    # RIGHT side annotation
+    annotate(
+      "text",
+      x = x_pos,
+      y = max(class_contrib_top$mean_phi, na.rm = TRUE) * 0.7,
+      label = "→ increases probability",
+      hjust = -0.1,
+      vjust = -0.5,
+      color = "darkgreen",
+      size = 6
+    ) +
+    
+    # LEFT side annotation
+    annotate(
+      "text",
+      x = x_pos,
+      y = min(class_contrib_top$mean_phi, na.rm = TRUE) * 0.7,
+      label = "← decreases probability",
+      hjust = 1.1,
+      vjust = -0.5,
+      color = "darkred",
+      size = 6
+    ) +
+    
+    expand_limits(y = c(
+      min(class_contrib_top$mean_phi, na.rm = TRUE) * 1.5,
+      max(class_contrib_top$mean_phi, na.rm = TRUE) * 1.5
+    )) +
+    
+        theme_minimal() +
+        
+        theme(
+          axis.text.x = element_text(size = 14),
+          axis.text.y = element_text(size = 14),
+          axis.title.x = element_text(size = 16),
+          axis.title.y = element_text(size = 16),
+          plot.title = element_text(size = 18),
+          legend.text = element_text(size = 12),
+          legend.title = element_text(size = 14)
+        )
+      
+      print(class_plot)
 }
 ```
