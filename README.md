@@ -192,13 +192,17 @@ A quick glance at selected outputs from the workflow, based on chosen learners, 
 
   ### <p align="left"><i>Figure 8: Relative composition of TRUE/FALSE predictions by each learner across food categories.</i></p>
 
-- **Performance Comparison** — Aggregates and formats train/test performances of tuned learners using multiple metrics.
+- **Performance Comparison** — Aggregates and formats train/test performances of tuned learners using multiple metrics (Figure 9).
 
   ![Figure 9](output/figures/Fig9.svg)
 
     ### <p align="left"><i>Figure 9: For each model, bars show the test–train performance difference across classification metrics, indicating over/under-fitting.</i></p>
 
-- **Feature Importance** — Model explainability: permutation importance or `SHAP` (**in development**).
+- **Feature Importance** — Model explainability: permutation importance or `SHAP` (Figure 10).
+
+  ![Figure 10](output/figures/Fig10.svg)
+
+    ### <p align="left"><i>Figure 10: Example of class-specific SHAP contribution for XGBoost, based on 100 samples and 10 features.</i></p>
 
 ## Acknowledgements
 - [MASTER](https://www.master-h2020.eu/) — Microbiome Applications for Sustainable food systems through Technologies and Enterprise.
