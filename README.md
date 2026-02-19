@@ -202,7 +202,7 @@ A quick glance at selected outputs from the workflow, based on chosen learners, 
 
   ![Figure 10](output/figures/Fig10.svg)
 
-    ### <p align="left"><i>Figure 10: Example of class-specific SHAP contribution for XGBoost, based on 100 samples and 10 features.</i></p>
+    ### <p align="left"><i>Figure 10: Example of class-specific SHAP contribution for TabPFN, based on 100 samples. Only the first 10 features are displayed.</i></p>
 
 ## Acknowledgements
 - [MASTER](https://www.master-h2020.eu/) — Microbiome Applications for Sustainable food systems through Technologies and Enterprise.
