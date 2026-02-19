@@ -3,7 +3,7 @@ title: "cFMDbench: ML classification of metagenomic shotgun data with mlr3"
 subtitle: "Case study: cFMD v1.3.0 (curated Food Metagenomic Data)"
 author: 
 - "Livio Antonielli"
-date: "2025/11/27"
+date: "2026/02/19"
 eeditor_options: 
   chunk_output_type: console
 format: html
@@ -38,8 +38,7 @@ all_methods <- list(
   xgboost = "XGBoost"
 )
 
-# pick_method <- c("mlp", "ranger", "svm", "xgboost")
-pick_method <- c("ranger", "xgboost")
+pick_method <- c("ranger", "xgboost") #example
 
 # resolve selection
 methods <- if (identical(pick_method, "all")) all_methods else {
@@ -233,6 +232,18 @@ manifest <- if (file.exists(manifest_path)) readRDS(manifest_path) else list()
 #### Import Data
 
 ```{r import, echo=FALSE, message=FALSE, warning=FALSE}
+# Helper: build GitHub Contents API URLs pinned to a ref (tag/commit)
+cfmd_ref <- ver  # the code was tested on v1.3.0
+
+gh_contents_url <- function(path, ref = cfmd_ref) {
+  paste0(
+    "https://api.github.com/repos/SegataLab/cFMD/contents/",
+    path,
+    "?ref=",
+    ref
+  )
+}
+
 # Define a download helper
 get_projects <- function(base_url) {
   resp <- GET(base_url, add_headers(Authorization = paste("token", GITHUB_TOKEN)))
@@ -244,7 +255,7 @@ get_projects <- function(base_url) {
 # Download only if sha changed, otherwise read from disk
 read_profile_cached <- function(project) {
   file_path <- sprintf("cFMD_data/%s/%s_taxonomic_profiles.tsv", project, project)
-  api_url   <- paste0("https://api.github.com/repos/SegataLab/cFMD/contents/", file_path)
+  api_url   <- gh_contents_url(file_path)
 
   meta <- GET(api_url, add_headers(Authorization = paste("token", GITHUB_TOKEN)))
   if (status_code(meta) != 200) {
@@ -281,7 +292,30 @@ read_profile_cached <- function(project) {
 
   # robust read
   df <- tryCatch({
-    read_tsv(local_tsv, col_types = cols(), show_col_types = FALSE) %>% rename(Taxon = 1)
+    # Detect malformed header pattern:
+    #   line 1: <TAB><project>	<project>	... (duplicate project name, empty first cell)
+    #   line 2: sample	<project__SRS...>	...
+    # In this case, promote line 2 to header and drop line 1+2 from data.
+    lines2 <- readLines(local_tsv, n = 2, warn = FALSE)
+
+    weird_header <- length(lines2) >= 2 &&
+      # line 1 often starts with a tab (empty first cell) and/or repeats the project name
+      grepl("^\t", lines2[1]) &&
+      grepl("^sample\t", lines2[2])
+
+    if (weird_header) {
+      tmp <- read_tsv(local_tsv, col_names = FALSE, col_types = cols(), show_col_types = FALSE)
+
+      # Row 2 contains true column names: 'sample', '<project__SRS...>', ...
+      new_names <- as.character(tmp[2, ])
+      tmp <- tmp[-c(1, 2), , drop = FALSE]
+      names(tmp) <- new_names
+
+      tmp %>% rename(Taxon = 1)
+    } else {
+      read_tsv(local_tsv, col_types = cols(), show_col_types = FALSE) %>%
+        rename(Taxon = 1)
+    }
   }, error = function(e) {
     message("Failed to parse: ", project, " - ", e$message)
     NULL
@@ -289,8 +323,11 @@ read_profile_cached <- function(project) {
   df
 }
 
-# Load and Merge Data
+# Load and merge data
 closeAllConnections()
+
+# IMPORTANT: base_url must already include ?ref=ver, e.g.
+# base_url <- gh_contents_url("cFMD_data")
 projects <- get_projects(base_url)
 
 batch_size <- 10
@@ -306,57 +343,91 @@ for (batch in batches) {
 }
 
 message("Loaded ", length(profile_list), " profiles out of ", length(projects), " projects.")
-
 if (length(profile_list) == 0) stop("No profiles loaded.")
 
 merged_profiles <- reduce(profile_list, full_join, by = "Taxon")
 message("Merged to ", nrow(merged_profiles), " rows × ", ncol(merged_profiles), " cols.")
 
-# Filter by Completeness threshold
+# Robust split: metadata vs taxa rows (no hard-coded first N rows)
+# Primary signal: Taxon label looks like a taxonomy string.
+# In cFMD v1.3.x many taxa use rank prefixes (k__/p__/...) and '|' separators.
+# Secondary signal: rows are numeric-like across sample columns.
+sample_cols <- setdiff(names(merged_profiles), "Taxon")
 
-# Separate metadata (first 7 rows) and taxonomic data
-metadata <- merged_profiles[1:7, ]
-taxa_only <- merged_profiles[-(1:7), ]
+taxon_chr <- as.character(merged_profiles$Taxon)
 
-# Convert to numeric (excluding 'Taxon')
-taxa_only[-1] <- lapply(taxa_only[-1], as.numeric)
+is_taxa_by_label <-
+  grepl("^(?:[dkpcofgs]__|k__)", taxon_chr) | # rank prefixes
+  grepl("\\|", taxon_chr) | # taxonomy separators in cFMD
+  grepl(";", taxon_chr, fixed = TRUE)
 
-# Replace NAs in taxa_only with 0
-taxa_only[is.na(taxa_only)] <- 0
+num_ok_frac <- apply(merged_profiles[sample_cols], 1, function(r) {
+  mean(!is.na(suppressWarnings(as.numeric(r))))
+})
 
-# Calculate column sums
-column_sums <- colSums(taxa_only[-1])
+is_taxa_by_numeric <- num_ok_frac > 0.9
 
-# Identify samples above threshold
+# Accept taxa if EITHER signal fires (label-based is robust to mixed columns)
+is_taxa <- is_taxa_by_label | is_taxa_by_numeric
+
+metadata  <- merged_profiles[!is_taxa, , drop = FALSE]
+taxa_only <- merged_profiles[ is_taxa, , drop = FALSE]
+
+message("Taxa rows detected: ", nrow(taxa_only), " | metadata rows: ", nrow(metadata))
+
+# Convert to numeric (excluding 'Taxon') and replace NAs with 0
+if (nrow(taxa_only) == 0) stop("No taxa rows detected after merge (check input structure/ref).")
+
+for (nm in sample_cols) {
+  taxa_only[[nm]] <- suppressWarnings(as.numeric(taxa_only[[nm]]))
+  taxa_only[[nm]][is.na(taxa_only[[nm]])] <- 0
+}
+
+# Filter by completeness threshold (sum of taxa per sample)
+column_sums <- colSums(taxa_only[sample_cols], na.rm = TRUE)
 good_samples <- names(column_sums[column_sums >= completeness_threshold])
 
-# Filter both metadata and taxonomic data
-filtered_taxa <- taxa_only[, c("Taxon", good_samples)]
-filtered_metadata <- metadata[, c("Taxon", good_samples)]
+# Keep Taxon + good samples; handle edge cases
+if (length(good_samples) == 0) stop("No samples meet completeness_threshold.")
 
-# Recombine metadata and filtered data
-filtered_profiles <- rbind(filtered_metadata, filtered_taxa)
+filtered_taxa <- taxa_only[, c("Taxon", good_samples), drop = FALSE]
+# Keep the same sample columns as filtered_taxa to make bind_rows safe
+filtered_metadata <- metadata[, c("Taxon", good_samples), drop = FALSE]
 
-# Summary
+# Ensure compatible column types for row-binding:
+# metadata sample columns are character; taxa sample columns are numeric.
+# Coerce taxa sample columns to character; convert back to numeric after transpose.
+filtered_taxa <- filtered_taxa %>%
+  mutate(across(all_of(good_samples), as.character))
+
+# Recombine (metadata rows first, then taxa)
+filtered_profiles <- bind_rows(filtered_metadata, filtered_taxa)
+
 cat("Kept", length(good_samples), "samples with ≥", completeness_threshold, "% completeness.\n")
 
-# Transpose the filtered_profiles (excluding 'Taxon' column)
+# Transpose to sample x features table
 transposed_matrix <- t(filtered_profiles[-1])
-
-# Convert to data frame and assign proper column names using the 'Taxon' values
 transposed_df <- as.data.frame(transposed_matrix)
-colnames(transposed_df) <- filtered_profiles$Taxon
 
-# Convert taxonomic abundances to numeric 
-transposed_df %<>%
-  mutate(
-    across(
-      .cols = -c(1:7),
-      .fns = ~ suppressWarnings(as.numeric(.x))
-    )
-  )
+# Column names come from Taxon values; make them unique to avoid silent renames later
+colnames(transposed_df) <- make.unique(as.character(filtered_profiles$Taxon))
 
-# Re-order the levels in each categorical factor 
+# Capture sample ids from the transpose rownames (these are the original sample column names)
+sample_ids <- rownames(transposed_df)
+if (is.null(sample_ids)) {
+  sample_ids <- as.character(seq_len(nrow(transposed_df)))
+}
+
+# If the metadata contains a column named 'sample', keep it but rename it to avoid collision
+if ("sample" %in% names(transposed_df)) {
+  transposed_df <- dplyr::rename(transposed_df, sample_meta = sample)
+}
+
+# Add explicit sample id column (never coerce this to numeric)
+transposed_df <- tibble::as_tibble(transposed_df)
+transposed_df$sample <- sample_ids
+
+# Re-order the levels in each categorical factor (metadata only)
 reorder_factor <- function(x) {
   if (is.character(x) || is.factor(x)) {
     factor(x, levels = sort(unique(x)))
@@ -365,50 +436,38 @@ reorder_factor <- function(x) {
   }
 }
 
+meta_cols <- names(transposed_df)[!startsWith(names(transposed_df), "k__")]
+
 tab_raw <- transposed_df %>%
   mutate(
-    across(where(~ is.character(.x) || is.factor(.x)), reorder_factor)
+    across(all_of(meta_cols), reorder_factor)
   )
 
-# Plot bad samples
+# Plot samples whose taxa sum deviates from 100
+# Assumes the intended scale is 0..100; adjust target to 1 if needed
+column_sums_all <- colSums(taxa_only[sample_cols], na.rm = TRUE)
 
-# Filter taxonomic rows (i.e., drop metadata rows)
-taxa_only <- merged_profiles[-(1:7), ]
+bad_samples <- names(column_sums_all)[abs(column_sums_all - 100) > 1e-3]
+bad_sums <- column_sums_all[bad_samples]
 
-# Convert all columns except 'Taxon' to numeric
-taxa_only[-1] <- lapply(taxa_only[-1], as.numeric)
-
-# Replace NAs with 0 in numeric columns
-taxa_only[-1] <- lapply(taxa_only[-1], \(col) replace(col, is.na(col), 0))
-
-# Calculate sums
-column_sums <- colSums(taxa_only[-1], na.rm = TRUE)
-
-# Identify samples where sums deviate from 100 (or 1, depending on your scale)
-bad_samples <- names(column_sums)[abs(column_sums - 100) > 1e-3]
-bad_sums <- column_sums[bad_samples]
-
-# Extract project name from sample names (everything before "__")
 project_names <- sapply(strsplit(bad_samples, "__"), `[`, 1)
 
-# Create a data frame for plotting
 bad_df <- data.frame(
   sample = bad_samples,
-  Sum = bad_sums,
+  Sum = as.numeric(bad_sums),
   Project = project_names
 )
 
-# Make a plot of samples with completeness below defined threshold
 if (nrow(bad_df) > 0) {
   p <- ggplot(bad_df, aes(x = Sum, y = reorder(sample, Sum), text = paste("Project:", Project))) +
     geom_bar(stat = "identity") +
     facet_wrap(~ Project, scales = "free_y") +
     labs(x = "Sum", y = "sample") +
     theme_minimal()
-  
+
   ggplotly(p, tooltip = "text")
 } else {
-  message("All samples meet the completeness threshold.")
+  message("All samples meet the completeness check (sum ~ 100).")
 }
 ```
 
@@ -766,7 +825,31 @@ ggplot(ts_df, aes(tSNE1, tSNE2, fill = target)) +
 #### Define Task
 
 ```{r task, echo=FALSE, message=FALSE, warning=FALSE}
-# Split dataset into training and test sets
+# Basic cleanup
+tab$sample <- trimws(as.character(tab$sample))
+
+# Required columns are already standardized upstream
+stopifnot("sample" %in% names(tab), "target" %in% names(tab))
+
+# Optional diagnostics (only if duplicates exist)
+if (anyDuplicated(tab$sample)) {
+  dups <- tab$sample[duplicated(tab$sample)]
+  message("Duplicated sample IDs: ", length(dups))
+  print(head(unique(dups), 25))
+
+  print(
+    tab %>%
+      filter(sample %in% unique(dups)) %>%
+      arrange(sample) %>%
+      select(sample, target) %>%
+      head(30)
+  )
+
+  tab$sample_id <- make.unique(tab$sample)
+  id_col <- "sample_id"
+} else {
+  id_col <- "sample"
+}
 
 # Build task with a stable primary key and remove it from features
 stopifnot("sample" %in% names(tab), !anyDuplicated(tab$sample))
@@ -776,19 +859,19 @@ task <- mlr3::as_task_classif(backend, target = "target")
 # Keep sample for reference, but not as a feature
 task$set_col_roles("sample", roles = character())
 
-# Split by row_ids
+# Split
 split <- partition(task, ratio = 0.8)
 task_train <- task$clone(deep = TRUE)$filter(split$train)
 task_test  <- task$clone(deep = TRUE)$filter(split$test)
 
-# Set positive class for binary classification (useful for evaluation metrics)
+# Positive class (binary)
 if (dataset_attr == "binary") {
   task$positive <- positive_class
   task_train$positive <- positive_class
   task_test$positive  <- positive_class
 }
 
-# Stratify target variable for balanced class distribution
+# Stratify
 task$set_col_roles("target", c("target", "stratum"))
 task_train$set_col_roles("target", c("target", "stratum"))
 task_test$set_col_roles("target", c("target", "stratum"))
