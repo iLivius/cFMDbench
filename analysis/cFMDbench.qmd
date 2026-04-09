@@ -1,0 +1,1077 @@
+---
+title: "cFMDbench: ML classification of metagenomic shotgun data with mlr3"
+subtitle: "Case study: cFMD (curated Food Metagenomic Data)"
+author:
+  - "Livio Antonielli"
+date: today
+format: html
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+#### Setup
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Locate project root: env var → knitr root.dir → config.yaml walk-up → cwd
+find_project_root <- function() {
+  env_root <- Sys.getenv("CFMD_BENCH_WORKDIR", unset = "")
+  if (nzchar(env_root) && dir.exists(env_root)) return(normalizePath(env_root))
+
+  knitr_root <- tryCatch(
+    normalizePath(knitr::opts_knit$get("root.dir"), mustWork = FALSE),
+    error = function(e) ""
+  )
+  if (nzchar(knitr_root) && dir.exists(knitr_root)) return(knitr_root)
+
+  start <- tryCatch(
+    dirname(normalizePath(knitr::current_input(), mustWork = FALSE)),
+    error = function(e) getwd()
+  )
+  d <- start
+  for (i in seq_len(10L)) {
+    if (file.exists(file.path(d, "config.yaml"))) return(d)
+    parent <- dirname(d)
+    if (parent == d) break
+    d <- parent
+  }
+  getwd()
+}
+
+root <- find_project_root()
+setwd(root)
+knitr::opts_knit$set(root.dir = root)
+```
+
+#### Methods and Libraries
+
+```{r libraries, echo=FALSE, message=FALSE, warning=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+source(file.path(root, "R", "cfmdbench_config_helpers.R"))
+
+cfg <- cfmdbench_load_config(file.path(root, "config.yaml"))
+
+methods         <- cfmdbench_resolve_methods(cfg$methods$pick)
+needs_mlr3torch <- "mlp"    %in% names(methods)
+needs_tabpfn    <- "tabpfn" %in% names(methods)
+
+cat("Methods selected:\n"); print(methods)
+
+# ── Package loading ────────────────────────────────────────────────────────────
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+
+base_pkgs <- c(
+  "callr", "coin", "compositions", "conflicted", "cowplot", "data.table", "emoa",
+  "factoextra", "FactoMineR", "farff", "fastVoteR", "FSelectorRcpp", "future",
+  "future.apply", "httr", "iml", "jsonlite", "kknn", "magrittr",
+  "mlr3filters", "mlr3fselect", "mlr3hyperband", "mlr3learners", "mlr3oml",
+  "mlr3pipelines", "mlr3tuning", "mlr3tuningspaces", "mlr3viz", "paradox",
+  "parallel", "patchwork", "plotly", "progressr", "ranger", "Rtsne", "scales",
+  "smotefamily", "stabm", "tidyverse", "vegan", "wordcloud", "wordcloud2",
+  "yaml", "zCompositions"
+)
+torch_pkgs  <- if (needs_mlr3torch) "mlr3torch"                        else character()
+tabpfn_pkgs <- if (needs_tabpfn)    c("reticulate", "mlr3extralearners") else "mlr3extralearners"
+
+pkgs <- unique(c(base_pkgs, torch_pkgs, tabpfn_pkgs))
+do.call(pacman::p_load, c(as.list(pkgs), install = TRUE))
+
+# Solve known conflicts
+conflict_prefer("select",   "dplyr")
+conflict_prefer("filter",   "dplyr")
+conflict_prefer("rename",   "dplyr")
+conflict_prefer("mutate",   "dplyr")
+conflict_prefer("first",    "dplyr")
+conflict_prefer("var",      "compositions")
+conflict_prefer("progress", "httr")
+
+# Source helper scripts
+source(file.path(root, "R", "cfmdbench_data_helpers.R"))
+source(file.path(root, "R", "cfmdbench_training_helpers.R"))
+source(file.path(root, "R", "cfmdbench_scoring_helpers.R"))
+
+# Configure optional backends (TabPFN / mlr3torch)
+cfmdbench_setup_backends(cfg, needs_tabpfn, needs_mlr3torch, root)
+```
+
+#### Set Parameters
+
+```{r parameters, echo=FALSE, message=FALSE, warning=FALSE}
+lgr::get_logger("mlr3")$set_threshold("off")
+lgr::get_logger("bbotk")$set_threshold("off")
+
+# Execution settings from config
+seed         <- cfg$execution$seed
+kfold        <- cfg$execution$kfold
+repeats      <- cfg$execution$repeats
+num_threads  <- cfg$execution$num_threads %||% parallel::detectCores()
+num_jobs     <- kfold
+term_min     <- cfg$execution$term_min
+fast_tuning  <- cfg$execution$fast_tuning
+learner_fallback <- cfg$execution$learner_fallback
+
+set.seed(seed)
+options(future.globals.maxSize = cfg$execution$future_globals_max_size_gb * 1024^3)
+handlers(global = TRUE)
+
+# Dataset settings
+ds     <- cfg$dataset$id
+ver    <- cfg$dataset$version
+target <- cfg$dataset$target
+
+run_date <- cfg$dataset$run_date %||% ""
+if (!nzchar(run_date)) run_date <- as.character(Sys.Date())
+
+save_dir <- paste(run_date, ds, ver, "saved_learners", sep = "_")
+if (!dir.exists(save_dir)) {
+  dir.create(save_dir, recursive = TRUE)
+  message("Created: ", save_dir)
+} else {
+  message("Using:   ", save_dir)
+}
+
+# Data source
+cache_dir     <- file.path("cache_cFMD", ver)
+manifest_path <- file.path(cache_dir, paste0(ds, "_", ver, "_manifest.rds"))
+
+completeness_threshold <- cfg$data_source$completeness_threshold
+api_batch_size         <- cfg$data_source$api_batch_size
+
+# Preprocessing
+min_samples_per_class <- cfg$preprocessing$min_samples_per_class
+samples_to_keep       <- cfg$preprocessing$samples_to_keep
+smote                 <- cfg$preprocessing$smote
+filtering             <- cfg$preprocessing$filtering
+selecting             <- cfg$preprocessing$selecting
+
+# Visualisation
+downsample_n    <- cfg$visualisation$downsample_n
+prevalence_min  <- cfg$visualisation$prevalence_min
+shap_n_samples  <- cfg$visualisation$shap_n_samples
+shap_n_features <- cfg$visualisation$shap_n_features
+```
+
+#### Import Data
+
+```{r import, echo=FALSE, message=FALSE, warning=FALSE}
+tab_raw <- cfmdbench_load_data(
+  repo                   = cfg$data_source$repo,
+  data_path              = cfg$data_source$path,
+  ref                    = ver,
+  cache_dir              = cache_dir,
+  manifest_path          = manifest_path,
+  completeness_threshold = completeness_threshold,
+  batch_size             = api_batch_size
+)
+
+# Plot samples whose taxa sum deviates from 100
+sample_cols     <- grep("^k__", names(tab_raw), value = TRUE)
+taxa_wide       <- tab_raw[, sample_cols]
+col_sums_all    <- colSums(
+  suppressWarnings(apply(taxa_wide, 2L, as.numeric)), na.rm = TRUE)
+bad_samples     <- names(col_sums_all)[abs(col_sums_all - 100) > 1e-3]
+
+if (length(bad_samples)) {
+  bad_df <- data.frame(
+    sample  = bad_samples,
+    Sum     = as.numeric(col_sums_all[bad_samples]),
+    Project = sapply(strsplit(bad_samples, "__"), `[`, 1L)
+  )
+  p <- ggplot(bad_df, aes(x = Sum, y = reorder(sample, Sum),
+                           text = paste("Project:", Project))) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~ Project, scales = "free_y") +
+    labs(x = "Sum", y = "Sample") +
+    theme_minimal()
+  ggplotly(p, tooltip = "text")
+} else {
+  message("All samples pass the completeness check (sum ~ 100).")
+}
+```
+
+#### Visualize Data I
+
+```{r visualize, echo=FALSE, message=FALSE, warning=FALSE}
+# Count observations per category
+category_counts <- tab_raw %>%
+  group_by(category) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(category = str_replace_all(category, "_", " "))
+
+lolli_1 <- ggplot(category_counts, aes(x = reorder(category, count), y = count)) +
+  geom_segment(aes(xend = category, yend = 0), color = "steelblue", linewidth = 1.2) +
+  geom_point(color = "steelblue", size = 12) +
+  geom_text(aes(label = count), color = "white", fontface = "bold", size = 3) +
+  theme_minimal() + coord_flip() +
+  labs(title = "Samples per category", x = target, y = "Count") +
+  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        plot.title = element_text(size = 18))
+
+types_per_category <- tab_raw %>%
+  group_by(category) %>%
+  summarise(type_count = n_distinct(type), .groups = "drop") %>%
+  mutate(category = str_replace_all(category, "_", " "))
+
+lolli_2 <- ggplot(types_per_category,
+                   aes(x = reorder(category, type_count), y = type_count)) +
+  geom_segment(aes(xend = category, yend = 0), color = "darkorange", linewidth = 1.2) +
+  geom_point(color = "darkorange", size = 12) +
+  geom_text(aes(label = type_count), color = "white", fontface = "bold", size = 3) +
+  theme_minimal() + coord_flip() +
+  labs(title = "Types per category", x = NULL, y = "Number of types") +
+  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        plot.title = element_text(size = 18))
+
+plot_grid(lolli_1, lolli_2, ncol = 2)
+
+# Dairy breakdown
+dairy_counts <- tab_raw %>%
+  dplyr::filter(category == "dairy") %>%
+  dplyr::mutate(type = str_replace_all(type, "_", " ")) %>%
+  group_by(type) %>%
+  summarise(count = n(), .groups = "drop")
+
+ggplot(dairy_counts, aes(x = reorder(type, count), y = count)) +
+  geom_bar(stat = "identity", fill = "darkcyan") +
+  geom_text(aes(label = count), vjust = -0.5, size = 4) +
+  theme_minimal() +
+  labs(title = "Samples per dairy type", x = "Dairy type", y = "Count") +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title  = element_text(size = 16),
+        plot.title  = element_text(size = 18))
+
+# Cheese word cloud
+cheese_counts <- tab_raw %>%
+  dplyr::filter(category == "dairy", type == "cheese") %>%
+  dplyr::mutate(subtype = str_replace_all(subtype, "_", " ")) %>%
+  group_by(subtype) %>%
+  summarise(count = n(), .groups = "drop")
+
+wordcloud(
+  words = cheese_counts$subtype, freq = cheese_counts$count,
+  min.freq = 1, max.words = 200, random.order = FALSE,
+  rot.per = 0.35, scale = c(2.5, 0.25),
+  colors = RColorBrewer::brewer.pal(8, "Dark2")
+)
+```
+
+#### Pre-Process I
+
+```{r preprocess1, echo=FALSE, message=FALSE, warning=FALSE}
+# Convert to correct types and keep sample + target + microbial features
+tab <- tab_raw %>%
+  mutate(across(starts_with("k__"), as.numeric)) %>%
+  mutate(
+    !!as.symbol(target) := factor(
+      !!as.symbol(target),
+      levels = sort(unique(!!as.symbol(target)))
+    )
+  ) %>%
+  select(sample, !!as.symbol(target), starts_with("k__"))
+
+names(tab)[names(tab) == target] <- "target"
+
+# Filter classes by minimum sample size
+tab <- tab %>%
+  group_by(target) %>%
+  mutate(n = n()) %>%
+  filter(n >= min_samples_per_class) %>%
+  slice_sample(prop = samples_to_keep) %>%
+  ungroup() %>%
+  select(-n) %>%
+  as.data.frame() %>%
+  droplevels()
+
+# Determine classification type and metrics
+positive_class <- ""
+if (length(levels(tab$target)) > 2L) {
+  dataset_attr  <- "multi-class"
+  bmr_measures  <- c("classif.acc", "classif.bacc", "classif.logloss")
+  train_measures <- c("classif.bacc", "classif.logloss")
+} else if (length(levels(tab$target)) == 2L) {
+  dataset_attr  <- "binary"
+  bmr_measures  <- c("classif.acc", "classif.bacc", "classif.logloss",
+                     "classif.precision", "classif.recall", "classif.specificity",
+                     "classif.fbeta", "classif.auc", "classif.prauc")
+  train_measures <- c("classif.bacc", "classif.logloss")
+  if (!nzchar(positive_class)) {
+    positive_class <- names(which.min(table(tab$target)))
+  }
+} else {
+  stop("Target column has < 2 classes — check the data or the target setting.")
+}
+
+cat("\nClassification type:", dataset_attr, "\n")
+cat("Evaluation metrics: ", paste(train_measures, collapse = ", "), "\n")
+
+tab %<>% rename_with(~ gsub("\\|", "_", .))
+tab %<>% sample_frac(size = 1)
+```
+
+#### Visualize Data II
+
+```{r visualize2, echo=FALSE, message=FALSE, warning=FALSE}
+.make_ordination_df <- function(tab_in, downsample_n, prevalence_min) {
+  df        <- as_tibble(tab_in) %>% mutate(target = str_replace_all(target, "_", " "))
+  taxa_cols <- setdiff(names(df), c("target", "sample"))
+
+  shorten_one <- function(n) {
+    if (grepl("s__", n)) return(sub(".*(s__.*)$", "\\1", n))
+    if (grepl("g__", n)) return(sub(".*(g__.*)$", "\\1", n))
+    n
+  }
+  new_names <- make.unique(vapply(taxa_cols, shorten_one, character(1L)), sep = "_")
+  names(df)[match(taxa_cols, names(df))] <- new_names
+
+  y <- df$target
+  X <- df[, !(names(df) %in% c("target", "sample")), drop = FALSE]
+
+  if (nrow(X) > downsample_n) {
+    idx <- sample(seq_len(nrow(X)), downsample_n)
+    X <- X[idx, , drop = FALSE]; y <- y[idx]
+  }
+
+  prev <- colMeans(X > 0)
+  X    <- X[, prev >= prevalence_min,    drop = FALSE]
+  X    <- X[, apply(X, 2L, var) > 0,    drop = FALSE]
+  if (!ncol(X)) stop("All features filtered; lower prevalence_min.")
+
+  X0    <- zCompositions::cmultRepl(as.matrix(X), label = 0, method = "CZM",
+                                    z.warning = 1, z.delete = FALSE)
+  X_clr <- compositions::clr(X0)
+  list(X = X, X_clr = X_clr, y = y)
+}
+
+ord <- .make_ordination_df(tab, downsample_n, prevalence_min)
+
+# PCA
+pca    <- prcomp(ord$X_clr, scale. = TRUE)
+scores <- data.frame(PC1 = pca$x[, 1L], PC2 = pca$x[, 2L], target = ord$y)
+
+fviz_eig(pca, addlabels = TRUE)
+
+ggplot(scores, aes(PC1, PC2, fill = target)) +
+  geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
+  scale_fill_viridis_d(option = "turbo") +
+  theme_bw() +
+  labs(title = "PCA on CLR-transformed abundances",
+       x = paste0("PC1 (", round(100 * summary(pca)$importance[2L, 1L], 1L), "%)"),
+       y = paste0("PC2 (", round(100 * summary(pca)$importance[2L, 2L], 1L), "%)"))
+
+fviz_contrib(pca, choice = "var", axes = 1:2, top = 10L)
+
+# Elbow plot
+cum_var      <- cumsum(pca$sdev^2 / sum(pca$sdev^2))
+n_comp_90    <- which(cum_var >= 0.9)[1L]
+cat("Components explaining 90% variance:", n_comp_90, "\n")
+
+ggplot(data.frame(k = seq_along(cum_var), v = cum_var), aes(k, v)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = n_comp_90, color = "dodgerblue3", linetype = "dashed") +
+  scale_x_continuous(breaks = seq_along(cum_var)) +
+  theme_bw() +
+  labs(title = "Elbow plot of PCA components",
+       subtitle = "Reference line: 90% variance threshold",
+       x = "Number of components", y = "Cumulative proportion of variance")
+
+# t-SNE
+perplexity <- pmin(30L, floor((nrow(ord$X_clr) - 1L) / 3L))
+ts <- Rtsne::Rtsne(ord$X_clr, pca = TRUE, check_duplicates = FALSE,
+                   perplexity = perplexity, theta = 0.5, num_threads = 8L)
+ts_df <- data.frame(tSNE1 = ts$Y[, 1L], tSNE2 = ts$Y[, 2L], target = ord$y)
+
+ggplot(ts_df, aes(tSNE1, tSNE2, fill = target)) +
+  geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
+  scale_fill_viridis_d(option = "turbo") +
+  theme_bw() +
+  labs(title = "t-SNE on CLR-transformed abundances") +
+  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        plot.title = element_text(size = 18), legend.text = element_text(size = 12))
+```
+
+#### Define Task
+
+```{r task, echo=FALSE, message=FALSE, warning=FALSE}
+tab$sample <- trimws(as.character(tab$sample))
+stopifnot("sample" %in% names(tab), "target" %in% names(tab))
+
+if (anyDuplicated(tab$sample)) {
+  dups <- tab$sample[duplicated(tab$sample)]
+  message("Duplicated sample IDs: ", length(dups))
+  tab$sample_id <- make.unique(tab$sample)
+  id_col <- "sample_id"
+} else {
+  id_col <- "sample"
+}
+
+backend  <- mlr3::as_data_backend(tab, primary_key = seq_len(nrow(tab)))
+task     <- mlr3::as_task_classif(backend, target = "target")
+task$set_col_roles("sample", roles = character())
+
+split      <- mlr3::partition(task, ratio = 0.8)
+task_train <- task$clone(deep = TRUE)$filter(split$train)
+task_test  <- task$clone(deep = TRUE)$filter(split$test)
+
+if (dataset_attr == "binary") {
+  task$positive       <- positive_class
+  task_train$positive <- positive_class
+  task_test$positive  <- positive_class
+}
+
+task$set_col_roles("target",       c("target", "stratum"))
+task_train$set_col_roles("target", c("target", "stratum"))
+task_test$set_col_roles("target",  c("target", "stratum"))
+```
+
+#### Pre-Process II
+
+```{r preprocess2, echo=FALSE, message=FALSE, warning=FALSE}
+# Class distribution
+class_counts    <- table(task_train$data()$target)
+majority_class  <- names(which.max(class_counts))
+minority_class  <- names(which.min(class_counts))
+imbalance_ratio <- class_counts[majority_class] / class_counts[minority_class]
+
+cat("\nClass distribution:\n"); print(class_counts)
+cat("Imbalance ratio:", round(imbalance_ratio, 2L), ":1\n")
+
+class_counts_df <- as.data.frame(class_counts)
+colnames(class_counts_df) <- c("target", "count")
+
+ggplot(class_counts_df, aes(x = reorder(target, count, decreasing = TRUE),
+                              y = count, fill = target)) +
+  geom_bar(stat = "identity", width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = count), vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_viridis_d(option = "turbo") +
+  theme_minimal(base_size = 14) +
+  labs(title = "Class Distribution", x = "Target Class", y = "Count") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# SMOTE decision
+imbalance_threshold <- 1.5
+apply_smote <- imbalance_ratio > imbalance_threshold &&
+               all(class_counts >= min_samples_per_class)
+
+if (!nzchar(smote)) smote <- if (apply_smote) "smote" else "none"
+if (!apply_smote)   smote <- "none"
+cat("SMOTE decision:", smote, "\n")
+
+# Build preprocessing pipeline
+if (selecting) filtering <- "minimal"
+
+preprocessing_pipe <- if (filtering == "varcor") {
+  mlr3pipelines::ppl("robustify") %>>%
+    mlr3pipelines::po("filter", filter = mlr3filters::flt("variance"),
+                      id = "variance_filter") %>>%
+    mlr3pipelines::po("filter", filter = mlr3filters::flt("find_correlation"),
+                      method = "spearman", id = "correlation_filter") %>>%
+    mlr3pipelines::po("colapply", applicator = as.numeric,
+                      affect_columns = mlr3pipelines::selector_type(
+                        c("integer", "logical", "numeric")))
+} else if (filtering %in% c(TRUE, "minimal") || selecting) {
+  mlr3pipelines::ppl("robustify") %>>%
+    mlr3pipelines::po("colapply", applicator = as.numeric,
+                      affect_columns = mlr3pipelines::selector_type(
+                        c("integer", "logical", "numeric")))
+} else if (filtering == "infogain") {
+  mlr3pipelines::ppl("robustify") %>>%
+    mlr3pipelines::po("filter", filter = mlr3filters::flt("information_gain"),
+                      id = "infogain_filter") %>>%
+    mlr3pipelines::po("colapply", applicator = as.numeric,
+                      affect_columns = mlr3pipelines::selector_type(
+                        c("integer", "logical", "numeric")))
+} else {
+  mlr3pipelines::po("nop")
+}
+
+if (!isFALSE(filtering)) {
+  preprocessing_pipe <- preprocessing_pipe %>>% mlr3pipelines::po("scale", center = TRUE)
+}
+
+smote_pipe <- NULL
+if (apply_smote && smote %in% c("smote", "blsmote", "adasyn")) {
+  smote_pipe <- switch(smote,
+    smote   = mlr3pipelines::po("smote"),
+    blsmote = mlr3pipelines::po("blsmote"),
+    adasyn  = mlr3pipelines::po("adas"),
+    NULL
+  )
+}
+if (!is.null(smote_pipe)) {
+  preprocessing_pipe <- preprocessing_pipe %>>% smote_pipe
+}
+
+# Remove lazy_tensor from all PipeOps (mlr3torch safety)
+for (po_name in names(preprocessing_pipe$pipeops)) {
+  po_obj <- preprocessing_pipe$pipeops[[po_name]]
+  priv   <- po_obj$.__enclos_env__$private
+  if (!is.null(priv$.feature_types) && "lt" %in% names(priv$.feature_types)) {
+    cat("Removing 'lazy_tensor' from:", po_name, "\n")
+    priv$.feature_types <- priv$.feature_types[names(priv$.feature_types) != "lt"]
+  }
+}
+
+cat("\nFinal preprocessing pipeline:\n"); print(preprocessing_pipe)
+
+# Preprocessing search space parameters
+preproc_params <- list()
+if (filtering == "varcor") {
+  preproc_params <- c(preproc_params, list(
+    variance_filter.filter.frac    = paradox::p_dbl(0.5, 1, logscale = TRUE),
+    correlation_filter.filter.frac = paradox::p_dbl(0.5, 1, logscale = TRUE)
+  ))
+} else if (filtering == "infogain") {
+  preproc_params <- c(preproc_params, list(
+    infogain_filter.filter.frac = paradox::p_dbl(0.2, 1.0, logscale = TRUE)
+  ))
+}
+if (!is.null(smote_pipe)) {
+  preproc_params <- c(preproc_params, switch(smote,
+    smote   = list(smote.K = paradox::p_int(2L, 5L),
+                   smote.dup_size = paradox::p_int(1L, 5L)),
+    blsmote = list(blsmote.K = paradox::p_int(2L, 5L),
+                   blsmote.dup_size = paradox::p_int(1L, 5L),
+                   blsmote.C = paradox::p_int(1L, 5L)),
+    adasyn  = list(adas.K = paradox::p_int(2L, 5L)),
+    list()
+  ))
+}
+```
+
+#### Feature Selection
+
+```{r feature_selection, echo=FALSE, message=FALSE, warning=FALSE}
+future::plan(future::sequential)
+future::plan(future::multisession, workers = num_jobs)
+
+num_col <- cfg$feature_selection$num_col
+num_row <- cfg$feature_selection$num_row
+
+if (selecting) {
+  n_features <- if (task_train$ncol < num_col) 2L else 10L
+  fs_method  <- if (task_train$nrow > num_row) "simple" else "ensemble"
+
+  rfe       <- mlr3fselect::fs("rfe", n_features = n_features, feature_fraction = 0.8)
+  svm_rfe   <- mlr3fselect::clbk("mlr3fselect.svm_rfe")
+  one_se    <- mlr3fselect::clbk("mlr3fselect.one_se_rule")
+
+  max_nrounds  <- 500L
+  internal_ss  <- paradox::ps(nrounds = paradox::p_int(
+    upper = max_nrounds,
+    aggr  = function(x) as.integer(mean(unlist(x)))
+  ))
+  xgb_clbk <- mlr3fselect::clbk("mlr3fselect.internal_tuning",
+                                  internal_search_space = internal_ss)
+
+  fs_rpart   <- mlr3::lrn("classif.rpart")
+  fs_ranger  <- mlr3::lrn("classif.ranger",  importance = "permutation")
+  fs_svm     <- mlr3::lrn("classif.svm",     type = "C-classification", kernel = "linear")
+  fs_xgboost <- mlr3::lrn("classif.xgboost", nrounds = max_nrounds,
+                            early_stopping_rounds = 10L)
+  mlr3::set_validate(fs_xgboost, 0.2)
+  mlr3::set_threads(fs_ranger,  n = ceiling(num_threads / 5L))
+  mlr3::set_threads(fs_xgboost, n = ceiling(num_threads / 5L))
+
+  fs_rpart$id   <- "rpart"
+  fs_ranger$id  <- "rf"
+  fs_svm$id     <- "svm"
+  fs_xgboost$id <- "xgboost"
+
+  # Robustify tasks before FS
+  robust_pipe <- mlr3pipelines::ppl("robustify") %>>%
+    mlr3pipelines::po("colapply", applicator = as.numeric,
+                      affect_columns = mlr3pipelines::selector_type(
+                        c("integer", "logical", "numeric")))
+  robust_pipe$train(task_train)
+  task_train <- robust_pipe$predict(task_train)[[1L]]
+  task_test  <- robust_pipe$predict(task_test)[[1L]]
+
+  if (fs_method == "ensemble") {
+    efs <- mlr3fselect::ensemble_fselect(
+      fselector          = rfe,
+      task               = task_train,
+      learners           = list(fs_rpart, fs_ranger, fs_svm, fs_xgboost),
+      init_resampling    = mlr3::rsmp("subsampling", repeats = 50L, ratio = 0.8),
+      inner_resampling   = mlr3::rsmp("cv", folds = 5L),
+      inner_measure      = mlr3::msr("classif.ce"),
+      measure            = mlr3::msr("classif.bacc"),
+      terminator         = mlr3tuning::trm("none"),
+      callbacks          = list(
+        rpart   = list(one_se),
+        rf      = list(one_se),
+        svm     = list(one_se, svm_rfe),
+        xgboost = list(one_se, xgb_clbk)
+      ),
+      store_benchmark_result = FALSE
+    )
+
+    print(efs); head(efs$result)
+    print(autoplot(efs, type = "performance",  theme = theme_minimal(base_size = 14)))
+    print(autoplot(efs, type = "n_features",   theme = theme_minimal(base_size = 14)))
+    print(autoplot(efs, type = "pareto",       theme = theme_minimal(base_size = 14)))
+    print(autoplot(efs, type = "pareto", pareto_front = "estimated",
+                   theme = theme_minimal(base_size = 14)) +
+          scale_color_brewer(palette = "Set1") + labs(title = "Estimated Pareto front"))
+
+    kp <- efs$knee_points(type = "estimated")
+    n_feat <- if (is.na(kp$n_features)) {
+      message("Estimated knee point NA — using median feature count.")
+      median(efs$result$n_features, na.rm = TRUE)
+    } else {
+      message("Estimated knee point: ", kp$n_features, " features.")
+      kp$n_features
+    }
+
+    global_stab <- efs$stability("jaccard", global = TRUE)
+    message("Global stability (Jaccard): ", global_stab)
+    print(efs$stability("jaccard", global = FALSE))
+    print(autoplot(efs, type = "stability", theme = theme_minimal(base_size = 14)) +
+          scale_fill_brewer(palette = "Set1"))
+
+    consensus_av  <- efs$feature_ranking(method = "av", committee_size = n_feat,
+                                          use_weights = TRUE)
+    selected_feats <- consensus_av$feature
+    print(consensus_av)
+  } else {
+    fsi_obj <- mlr3fselect::fsi(
+      task       = task_train,
+      learner    = fs_ranger,
+      resampling = mlr3::rsmp("cv", folds = 5L),
+      measure    = mlr3::msr("classif.bacc"),
+      terminator = mlr3tuning::trm("none")
+    )
+    rfe$optimize(fsi_obj)
+    print(data.table::as.data.table(fsi_obj$result)[, .(features, classif.bacc)])
+    selected_feats <- fsi_obj$result_feature_set
+  }
+
+  task_train$select(selected_feats)
+  task_test$select(selected_feats)
+}
+```
+
+#### Visualize Data III
+
+```{r visualize3, echo=FALSE, message=FALSE, warning=FALSE}
+if (selecting) {
+  ord_post <- .make_ordination_df(task_train$data(), downsample_n, prevalence_min)
+
+  pca_post    <- prcomp(ord_post$X_clr, scale. = TRUE)
+  scores_post <- data.frame(PC1 = pca_post$x[, 1L], PC2 = pca_post$x[, 2L],
+                             target = ord_post$y)
+
+  print(fviz_eig(pca_post, addlabels = TRUE))
+
+  print(ggplot(scores_post, aes(PC1, PC2, fill = target)) +
+    geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
+    scale_fill_viridis_d(option = "turbo") + theme_bw() +
+    labs(title = "PCA on CLR (post feature selection)",
+         x = paste0("PC1 (", round(100 * summary(pca_post)$importance[2L, 1L], 1L), "%)"),
+         y = paste0("PC2 (", round(100 * summary(pca_post)$importance[2L, 2L], 1L), "%)")))
+
+  print(fviz_contrib(pca_post, choice = "var", axes = 1:2, top = 10L))
+
+  perp2 <- pmin(30L, floor((nrow(ord_post$X_clr) - 1L) / 3L))
+  ts2   <- Rtsne::Rtsne(ord_post$X_clr, pca = TRUE, check_duplicates = FALSE,
+                         perplexity = perp2, theta = 0.5, num_threads = 8L)
+  ts2_df <- data.frame(tSNE1 = ts2$Y[, 1L], tSNE2 = ts2$Y[, 2L], target = ord_post$y)
+
+  print(ggplot(ts2_df, aes(tSNE1, tSNE2, fill = target)) +
+    geom_point(shape = 21, size = 5, colour = "white", stroke = 0.8) +
+    scale_fill_viridis_d(option = "turbo") + theme_bw() +
+    labs(title = "t-SNE on CLR (post feature selection)") +
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+          plot.title = element_text(size = 18)))
+}
+```
+
+#### Train Models
+
+```{r train, echo=FALSE, message=FALSE, warning=FALSE}
+future::plan(future::sequential)
+future::plan(future::multisession, workers = num_jobs)
+
+base_learners   <- cfmdbench_build_learners(seed = seed, kfold = kfold)
+trained_learners <- cfmdbench_train_methods(
+  methods           = methods,
+  base_learners     = base_learners,
+  preprocessing_pipe = preprocessing_pipe,
+  preproc_params    = preproc_params,
+  task_train        = task_train,
+  train_measures    = train_measures,
+  dataset_attr      = dataset_attr,
+  save_dir          = save_dir,
+  kfold             = kfold,
+  repeats           = repeats,
+  num_threads       = num_threads,
+  num_jobs          = num_jobs,
+  fast_tuning       = fast_tuning,
+  learner_fallback  = learner_fallback,
+  term_min          = term_min
+)
+```
+
+#### Benchmark
+
+```{r benchmark, echo=FALSE, message=FALSE, warning=FALSE}
+measure <- c(accuracy = "classif.acc")
+
+future::plan(future::sequential)
+future::plan(future::multisession, workers = num_jobs)
+
+# Load / prepare learners for benchmarking
+min_count <- task_train$data() %>%
+  dplyr::count(target) %>% dplyr::pull(n) %>% min()
+
+benchmark_resampling <- if (min_count <= kfold) {
+  mlr3::rsmp("bootstrap", repeats = 10L, ratio = 1)
+} else {
+  mlr3::rsmp("cv", folds = kfold)
+}
+
+learners_best <- cfmdbench_load_benchmark_learners(
+  methods, trained_learners, save_dir, task_train)
+
+# Preprocessing summaries
+for (method in names(learners_best)) {
+  summary <- suppressWarnings(
+    cfmdbench_get_preproc_summary(learners_best[[method]],
+                                   after = if (apply_smote) smote else "scale"))
+  if (!is.null(summary)) {
+    cat(sprintf("\n--- [%s] ---\n", method))
+    if (!is.na(summary$n_features)) {
+      cat(sprintf("Final features (%d):\n", summary$n_features))
+      print(summary$features)
+      cat("Class distribution:\n"); print(summary$class_distribution)
+    } else {
+      cat("No Task output; see filter summary above.\n")
+    }
+  }
+}
+
+# Run benchmark
+start_bmr <- Sys.time()
+cat("Benchmark start:", format(start_bmr, "%Y-%m-%d %H:%M:%S"), "\n")
+bmr <- mlr3::benchmark(
+  design = mlr3::benchmark_grid(task_train, learners_best, benchmark_resampling))
+cat("Benchmark done: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("Time:", round(as.numeric(difftime(Sys.time(), start_bmr, units = "mins")), 2),
+    "minutes\n")
+
+# Autoplot
+autoplot(bmr, measure = mlr3::msr(measure[[1L]])) +
+  labs(x = "Method", y = paste(names(measure[1L]), "measure")) +
+  scale_x_discrete(labels = as.character(unlist(methods))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title  = element_text(size = 16),
+        plot.title  = element_text(size = 18, hjust = 0.5))
+
+# Summary table
+bench_df <- cfmdbench_format_bench_df(bmr, bmr_measures)
+print(bench_df %>% select(-learner_id))
+
+# Dodged barplot
+bench_long <- bench_df %>%
+  select(method, accuracy, `balanced accuracy`, logloss) %>%
+  pivot_longer(c(accuracy, `balanced accuracy`, logloss),
+               names_to = "measure", values_to = "value")
+
+metric_colors <- c(accuracy = "skyblue3", `balanced accuracy` = "dodgerblue3",
+                   logloss = "tomato3")
+
+ggplot(bench_long, aes(x = method, y = value, fill = measure)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  scale_fill_manual(values = metric_colors) +
+  geom_text(aes(label = round(value, 2L)),
+            position = position_dodge(width = 0.9), vjust = 1.5,
+            color = "white", size = 3L) +
+  theme_minimal() +
+  labs(title = "Model performance measures", x = "Method", y = "Value") +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 14),
+        axis.title  = element_text(size = 16),
+        plot.title  = element_text(size = 18))
+
+# Best model
+best_row      <- bench_df %>% arrange(desc(`balanced accuracy`), logloss) %>% slice(1L)
+best_model_id <- best_row$learner_id
+best_method   <- best_row$method
+
+# Average fold-wise predictions for best model
+pred_dt    <- data.table::as.data.table(bmr$score())
+best_preds <- pred_dt[stringr::str_detect(learner_id, best_model_id)]
+all_preds  <- best_preds$prediction_test %>%
+  purrr::map_dfr(~ data.table::as.data.table(.x) %>% tibble::as_tibble())
+prob_cols  <- grep("^prob\\.", names(all_preds), value = TRUE)
+
+if (length(prob_cols) == 2L) {
+  positive_col <- paste0("prob.", positive_class)
+  avg_preds <- all_preds %>%
+    group_by(row_ids) %>%
+    summarise(prob_positive = mean(.data[[positive_col]]),
+              truth = first(truth), .groups = "drop") %>%
+    mutate(
+      response = if_else(prob_positive >= 0.5, positive_class,
+                         setdiff(levels(truth), positive_class)),
+      response = factor(response, levels = levels(truth)),
+      correct  = response == truth
+    )
+} else {
+  avg_preds <- all_preds %>%
+    group_by(row_ids) %>%
+    summarise(
+      response = names(which.max(colMeans(across(all_of(prob_cols))))),
+      truth = first(truth), .groups = "drop"
+    ) %>%
+    mutate(response = sub("prob\\.", "", response),
+           response = factor(response, levels = levels(truth)),
+           correct  = response == truth)
+}
+
+pred_summary <- avg_preds %>%
+  group_by(truth, correct) %>%
+  summarise(N = n(), .groups = "drop") %>%
+  group_by(truth) %>%
+  mutate(prop = N / sum(N)) %>%
+  ungroup()
+
+p1 <- ggplot(pred_summary, aes(x = truth, y = N, fill = correct, label = N)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(position = position_stack(vjust = 0.5), color = "white") +
+  scale_fill_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3")) +
+  theme_minimal() +
+  labs(title = "Absolute Counts", x = "True Class", y = "Count", fill = "Correct") +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1))
+
+p2 <- ggplot(pred_summary,
+             aes(x = truth, y = prop, fill = correct,
+                 label = sprintf("%.0f%%", prop * 100))) +
+  geom_bar(stat = "identity", position = "fill") +
+  geom_text(position = position_stack(vjust = 0.5), color = "white") +
+  scale_fill_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3")) +
+  theme_minimal() +
+  labs(title = "Proportion Correct", x = "True Class", y = "Proportion", fill = "Correct") +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1))
+
+p3 <- ggplot(avg_preds, aes(x = truth, y = response, color = correct)) +
+  geom_jitter(alpha = 0.4, width = 0.25, height = 0.25) +
+  scale_color_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3")) +
+  theme_minimal() +
+  labs(title = "True vs Predicted", x = "True Class", y = "Predicted", color = "Correct") +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1))
+
+(p1 + p2 + p3) + plot_layout(ncol = 3) +
+  plot_annotation(title = paste("Prediction Overview —", best_method),
+                  theme = theme(plot.title = element_text(size = 16, face = "bold",
+                                                          hjust = 0.5)))
+```
+
+#### Prediction
+
+```{r prediction, echo=FALSE, message=FALSE, warning=FALSE}
+predictions <- list()
+
+for (method in names(methods)) {
+  best_model <- learners_best[[method]]
+
+  if (is.null(best_model)) {
+    path <- file.path(save_dir, paste0(method, "_tuned_learner.rds"))
+    if (!file.exists(path)) {
+      cat("SKIP:", method, "— no tuned learner found.\n"); next
+    }
+    best_model <- readRDS(path)
+    try(best_model$unmarshal(), silent = TRUE)
+    best_model$train(task_train)
+  }
+
+  pred              <- best_model$predict(task_test)
+  predictions[[method]] <- pred
+  sc                <- pred$score(mlr3::msr("classif.acc"))
+  cat("\nclassif.acc of", methods[[method]], ":", round(sc, 2L), "\n")
+
+  pred_tab       <- data.frame(truth = pred$truth, response = pred$response, pred$prob)
+  pred_tab$match <- ifelse(pred_tab$truth == pred_tab$response, "TRUE", "FALSE")
+  print(pred_tab %>% count(match) %>% mutate(ratio = round(n / sum(n), 2L)))
+
+  assign(paste(method, "test", "predict", sep = "_"), pred_tab)
+  assign(paste(method, "pred", "df",      sep = "_"),
+         pred$score(measures = lapply(bmr_measures, mlr3::msr)))
+}
+
+pred_df <- cfmdbench_gather_pred_performance(env = environment(), bench_df = bench_df)
+print(pred_df)
+
+pred_tabs <- cfmdbench_gather_pred_tabs(env = environment())
+plot_df   <- pred_tabs %>%
+  mutate(truth = factor(truth, levels = task_test$class_names),
+         match = factor(match, levels = c("TRUE", "FALSE"))) %>%
+  count(method, truth, match, name = "n") %>%
+  group_by(method, truth) %>%
+  mutate(pct = 100 * n / sum(n), label = paste0(round(pct, 1L), "%")) %>%
+  ungroup()
+
+ggplot(plot_df, aes(x = truth, y = pct, fill = match)) +
+  geom_col(width = 0.9) +
+  geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+            color = "white", size = 3L) +
+  facet_grid(method ~ ., scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("TRUE" = "dodgerblue3", "FALSE" = "red3"),
+                    name = "Correct") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1L),
+                     expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Class", y = "Percent of predictions",
+       title = "Test predictions by class and method") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+        strip.text.y = element_text(angle = 0),
+        panel.grid.major.x = element_blank(),
+        plot.title = element_text(size = 18))
+```
+
+#### Performance Comparison
+
+```{r performance_comparison, echo=FALSE, message=FALSE, warning=FALSE}
+metric_cols <- setdiff(names(bench_df), c("method", "learner_id"))
+
+bench_long2 <- bench_df %>%
+  pivot_longer(all_of(metric_cols), names_to = "metric", values_to = "value") %>%
+  mutate(dataset = "Train (Benchmark)")
+
+pred_long2 <- pred_df %>%
+  pivot_longer(all_of(metric_cols), names_to = "metric", values_to = "value") %>%
+  mutate(dataset = "Test (Prediction)")
+
+dumbbell_df <- bind_rows(bench_long2, pred_long2) %>%
+  mutate(metric = factor(metric, levels = rev(sort(unique(metric))))) %>%
+  select(method, metric, dataset, value) %>%
+  pivot_wider(names_from = dataset, values_from = value)
+
+ggplot(dumbbell_df, aes(y = metric, group = method)) +
+  geom_segment(aes(x = `Train (Benchmark)`, xend = `Test (Prediction)`,
+                   y = metric, yend = metric),
+               color = "gray60", linewidth = 1.2, alpha = 0.7) +
+  geom_point(aes(x = `Train (Benchmark)`, color = "Train"), size = 3L) +
+  geom_point(aes(x = `Test (Prediction)`,  color = "Test"),  size = 3L) +
+  facet_wrap(~ method, ncol = 1L, scales = "free_y") +
+  scale_color_manual(values = c(Train = "green3", Test = "magenta3")) +
+  theme_minimal(base_size = 16L) +
+  labs(title = "Model Performance: Train vs Test",
+       x = "Score", y = "Metric", color = "Dataset") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        legend.position = "right")
+
+ggplot(dumbbell_df, aes(y = method, group = metric)) +
+  geom_segment(aes(x = `Train (Benchmark)`, xend = `Test (Prediction)`, yend = method),
+               color = "gray60", linewidth = 1.2, alpha = 0.7) +
+  geom_point(aes(x = `Train (Benchmark)`, color = "Train"), size = 3L) +
+  geom_point(aes(x = `Test (Prediction)`,  color = "Test"),  size = 3L) +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_color_manual(values = c(Train = "green3", Test = "magenta3")) +
+  theme_minimal(base_size = 16L) +
+  labs(title = "Model Performance: Train vs Test",
+       x = "Score", y = "Method", color = "Dataset") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.border = element_rect(color = "grey70", fill = NA, linewidth = 0.6),
+        panel.spacing.x = unit(1.2, "lines"),
+        legend.position = "right")
+```
+
+#### Feature Importance
+
+```{r importance, echo=FALSE, message=FALSE, warning=FALSE}
+method <- best_model_id
+
+parse_taxon_name <- function(name) {
+  parsed <- stringr::str_extract(name, "(?<=_s__).*")
+  stringr::str_replace_all(parsed, "_t__", "_")
+}
+
+temp_dat  <- task_train$data()
+temp_tab  <- temp_dat %>% dplyr::select(-target) %>% as.data.frame()
+temp_targ <- temp_dat$target
+
+original_names   <- colnames(temp_tab)
+simplified_names <- vapply(original_names, parse_taxon_name, FUN.VALUE = character(1L))
+name_mapping     <- setNames(simplified_names, original_names)
+
+imodel    <- get(paste(method, "tuned", "learner", sep = "_"),
+                 envir = .GlobalEnv)
+
+temp_pred <- iml::Predictor$new(model = imodel, data = temp_tab,
+                                 y = temp_targ, type = "prob")
+
+future::plan(future::sequential)
+if (!method %in% c("mlp", "tabpfn"))
+  future::plan(future::multisession, workers = num_threads)
+
+n_samp <- min(shap_n_samples, nrow(temp_tab))
+idx    <- sample.int(nrow(temp_tab), n_samp)
+temp_small <- temp_tab[idx, , drop = FALSE]
+
+shap_list <- lapply(seq_len(nrow(temp_small)), function(i) {
+  s <- iml::Shapley$new(temp_pred, x.interest = temp_small[i, , drop = FALSE])
+  dplyr::mutate(s$results, sample_id = idx[i])
+})
+shap_all <- dplyr::bind_rows(shap_list)
+
+shap_agg <- shap_all %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(mean_abs_phi = mean(abs(phi)), .groups = "drop") %>%
+  dplyr::mutate(feature_pretty = dplyr::recode(feature, !!!name_mapping)) %>%
+  dplyr::arrange(desc(mean_abs_phi)) %>%
+  dplyr::slice_head(n = shap_n_features)
+
+ggplot(shap_agg, aes(x = reorder(feature_pretty, mean_abs_phi), y = mean_abs_phi)) +
+  geom_col(fill = "royalblue3") + coord_flip() +
+  labs(title = paste("Top", shap_n_features, "features by mean SHAP"),
+       subtitle = paste(n_samp, "samples used"),
+       x = "Feature (taxon)", y = "Mean |SHAP|") +
+  theme_minimal() +
+  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+        plot.title = element_text(size = 18))
+
+class_contrib <- shap_all %>%
+  dplyr::group_by(feature, class) %>%
+  dplyr::summarise(mean_phi = mean(phi), mean_abs_phi = mean(abs(phi)),
+                   .groups = "drop") %>%
+  dplyr::mutate(feature_pretty = dplyr::recode(feature, !!!name_mapping),
+                class = stringr::str_replace_all(class, "_", " ")) %>%
+  dplyr::filter(feature %in% shap_agg$feature)
+
+classes <- sort(unique(class_contrib$class))
+
+if (length(classes) == 2L) {
+  ref <- classes[1L]
+  ggplot(class_contrib %>% dplyr::filter(class == ref),
+         aes(x = reorder(feature_pretty, mean_phi), y = mean_phi,
+             fill = mean_phi > 0)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c("TRUE" = "#1f78b4", "FALSE" = "#e31a1c"),
+                      labels = c("Decreases P(ref)", "Increases P(ref)")) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste("Class-specific SHAP (reference:", ref, ")"),
+         subtitle = paste(n_samp, "samples,", shap_n_features, "features"),
+         x = "Feature", y = paste("Mean SHAP for", ref), fill = "Effect") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+          plot.title = element_text(size = 18))
+} else {
+  ggplot(class_contrib, aes(x = reorder(feature_pretty, mean_abs_phi),
+                             y = mean_phi, fill = class)) +
+    geom_col(position = "dodge") + coord_flip() +
+    scale_fill_viridis_d(option = "turbo") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = "Class-specific SHAP contributions",
+         subtitle = paste(n_samp, "samples,", shap_n_features, "features"),
+         x = "Feature (taxon)", y = "Mean SHAP value", fill = "Class") +
+    theme_minimal() +
+    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
+          plot.title = element_text(size = 18))
+}
+```

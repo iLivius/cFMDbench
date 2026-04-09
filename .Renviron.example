@@ -1,0 +1,16 @@
+# Project-local environment variable overrides.
+# Copy to .Renviron to activate (R reads .Renviron automatically).
+# Only include variables you actually want to override; blank assignments
+# (e.g. HF_TOKEN=) can shadow working values in your global ~/.Renviron.
+#
+# ── Required ──────────────────────────────────────────────────────────────────
+# GitHub personal access token with read:org scope (used to download cFMD data)
+# GITHUB_TOKEN=ghp_xxx
+#
+# ── Required for working directory resolution (optional if using Positron / VS Code) ──
+# CFMD_BENCH_WORKDIR=/path/to/cFMDbench
+#
+# ── Required only when using tabpfn ──────────────────────────────────────────
+# TABPFN_CONDA_ROOT=/path/to/miniconda3
+# TABPFN_ENV_NAME=cfmdbench-tabpfn-gpu
+# HF_TOKEN=hf_xxx
