@@ -1,0 +1,12 @@
+{
+  "_instructions": "Copy this file to settings.json and replace /path/to/miniconda3 with the output of: conda activate cfmdbench-r && echo $CONDA_PREFIX",
+  "r.rpath.linux": "/path/to/miniconda3/envs/cfmdbench-r/bin/R",
+  "r.rterm.linux": "/path/to/miniconda3/envs/cfmdbench-r/bin/R",
+  "python.defaultInterpreterPath": "/path/to/miniconda3/envs/cfmdbench-r/bin/python",
+  "terminal.integrated.env.linux": {
+    "CONDA_PREFIX": "/path/to/miniconda3/envs/cfmdbench-r",
+    "CONDA_DEFAULT_ENV": "cfmdbench-r",
+    "R_LIBS_USER": "/path/to/miniconda3/envs/cfmdbench-r/lib/R/library",
+    "PATH": "/path/to/miniconda3/envs/cfmdbench-r/bin:/path/to/miniconda3/condabin:${env:PATH}"
+  }
+}

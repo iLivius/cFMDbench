@@ -12,32 +12,24 @@
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
 cran_packages <- c(
-  # Core framework
   "callr", "coin", "compositions", "conflicted", "cowplot", "data.table",
   "emoa", "FactoMineR", "factoextra", "farff", "fastVoteR",
   "FSelectorRcpp", "future", "future.apply",
-  # Network / data
   "httr", "jsonlite",
-  # Learner backends
-  "glmnet", "MASS", "ranger", "e1071", "naivebayes", "xgboost",
-  # mlr3 ecosystem
+  "glmnet", "MASS", "ranger", "naivebayes",
   "iml", "lgr", "mlr3fairness", "mlr3filters", "mlr3fselect",
   "mlr3hyperband", "mlr3learners", "mlr3oml", "mlr3pipelines",
   "mlr3torch", "mlr3tuning", "mlr3tuningspaces", "mlr3viz",
   "pacman", "paradox", "progressr", "stabm",
-  # Visualisation
   "patchwork", "plotly", "Rtsne", "scales", "wordcloud", "wordcloud2",
-  # Compositional / ecological
   "vegan", "zCompositions",
-  # Utilities
   "magrittr", "readr", "remotes", "reticulate", "stringr", "tidyverse",
   "torch", "yaml"
 )
 
 # ── Conda-compiled packages ────────────────────────────────────────────────────
-# igraph, kknn, and smotefamily have compiled dependencies that are easiest to
-# satisfy through conda-forge. The function below installs them that way and
-# skips the conda call entirely when not in a Conda environment.
+# Packages with compiled dependencies are installed via conda-forge to avoid
+# toolchain mismatches. Falls back silently when not inside a Conda env.
 
 install_via_conda <- function(packages) {
   conda_prefix <- Sys.getenv("CONDA_PREFIX", unset = "")
@@ -47,8 +39,10 @@ install_via_conda <- function(packages) {
     return(invisible(FALSE))
   }
 
-  message("Installing compiled R packages from conda-forge: ",
-          paste(packages, collapse = ", "))
+  message(
+    "Installing compiled R packages from conda-forge: ",
+    paste(packages, collapse = ", ")
+  )
 
   status <- system2(
     conda_exe,
@@ -59,8 +53,10 @@ install_via_conda <- function(packages) {
   )
 
   if (!identical(status, 0L)) {
-    warning("Conda installation failed for: ", paste(packages, collapse = ", "),
-            ". Falling back to CRAN where possible.")
+    warning(
+      "Conda installation failed for: ", paste(packages, collapse = ", "),
+      ". Falling back to CRAN where possible."
+    )
     return(invisible(FALSE))
   }
   invisible(TRUE)
@@ -69,7 +65,9 @@ install_via_conda <- function(packages) {
 conda_r_package_map <- c(
   igraph      = "r-igraph",
   kknn        = "r-kknn",
-  smotefamily = "r-smotefamily"
+  smotefamily = "r-smotefamily",
+  e1071       = "r-e1071",
+  xgboost     = "r-xgboost"
 )
 
 missing_conda_pkgs <- names(conda_r_package_map)[!vapply(
@@ -95,16 +93,41 @@ if (length(missing_cran)) {
 if (!requireNamespace("mlr3extralearners", quietly = TRUE)) {
   remotes::install_github(
     "mlr-org/mlr3extralearners@*release",
-    upgrade     = "never",
+    upgrade      = "never",
     dependencies = TRUE
   )
 }
 
-# ── Optional: R torch backend (only needed for the 'mlp' learner) ──────────────
+# ── Optional: R torch backend (only needed for the 'mlp' learner) ─────────────
 if (identical(Sys.getenv("INSTALL_R_TORCH", unset = "0"), "1")) {
   if (!torch::torch_is_installed()) {
     torch::install_torch()
   }
 }
+
+# ── Post-install diagnostic ───────────────────────────────────────────────────
+all_packages <- unique(c(
+  cran_packages,
+  names(conda_r_package_map),
+  "mlr3", "mlr3extralearners"
+))
+
+is_available <- vapply(
+  all_packages, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1L)
+)
+ok  <- all_packages[ is_available]
+bad <- all_packages[!is_available]
+
+message("\n── Package check ───────────────────────────────────────────────")
+message(sprintf("OK      (%d): %s", length(ok), paste(sort(ok), collapse = ", ")))
+if (length(bad)) {
+  message(
+    sprintf("MISSING (%d): %s", length(bad), paste(sort(bad), collapse = ", "))
+  )
+  message("Re-run this script or install missing packages manually.")
+} else {
+  message("All packages present.")
+}
+message("────────────────────────────────────────────────────────────────")
 
 message("R package bootstrap completed for the active Conda environment.")

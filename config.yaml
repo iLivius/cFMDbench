@@ -44,8 +44,8 @@ preprocessing:
 
 # ── Feature selection ──────────────────────────────────────────────────────────
 feature_selection:
-  num_col: 100   # switch to ensemble FS when task has >= this many features
-  num_row: 100   # switch to ensemble FS when task has >= this many rows
+  num_col: 100   # target n_features = 10 when ncol >= this; 2 otherwise
+  num_row: 100   # use "simple" (single-learner RFE) when nrow > this; "ensemble" otherwise
 
 # ── Visualisation ──────────────────────────────────────────────────────────────
 visualisation:

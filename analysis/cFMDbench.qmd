@@ -13,7 +13,11 @@ editor_options:
 #### Setup
 
 ```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
-# Locate project root: env var → knitr root.dir → config.yaml walk-up → cwd
+# Locate the project root so every subsequent file.path() call is anchored to
+# the repo directory regardless of where the qmd is opened or rendered.
+# The cascade is: CFMD_BENCH_WORKDIR env var → knitr root.dir → walk up the
+# directory tree looking for config.yaml → fall back to getwd().
+# The env var override is useful when rendering headlessly (e.g. CI).
 find_project_root <- function() {
   env_root <- Sys.getenv("CFMD_BENCH_WORKDIR", unset = "")
   if (nzchar(env_root) && dir.exists(env_root)) return(normalizePath(env_root))
@@ -24,6 +28,7 @@ find_project_root <- function() {
   )
   if (nzchar(knitr_root) && dir.exists(knitr_root)) return(knitr_root)
 
+  # Walk up from the qmd file location until we find config.yaml (max 10 levels).
   start <- tryCatch(
     dirname(normalizePath(knitr::current_input(), mustWork = FALSE)),
     error = function(e) getwd()
@@ -48,10 +53,21 @@ knitr::opts_knit$set(root.dir = root)
 ```{r libraries, echo=FALSE, message=FALSE, warning=FALSE}
 options(repos = c(CRAN = "https://cloud.r-project.org"))
 
+# cfmdbench_config_helpers.R provides:
+#   cfmdbench_load_config()      — reads config.yaml, merges with built-in defaults
+#   cfmdbench_resolve_methods()  — validates method IDs from methods$pick
+#   cfmdbench_setup_backends()   — configures TabPFN (reticulate) or MLP (torch)
+#   %||%                         — null-coalescing operator used throughout
 source(file.path(root, "R", "cfmdbench_config_helpers.R"))
 
+# Load and merge config.yaml with built-in defaults.
+# If config.yaml is absent, all defaults from cfmdbench_default_config() are used.
 cfg <- cfmdbench_load_config(file.path(root, "config.yaml"))
 
+# Expand methods$pick ("all" or a subset like c("ranger", "xgboost")) into a
+# named character vector, e.g. c(ranger = "Random Forest", xgboost = "XGBoost").
+# This vector is used everywhere: to build learners, to label plots/tables,
+# and to gate optional backends.
 methods         <- cfmdbench_resolve_methods(cfg$methods$pick)
 needs_mlr3torch <- "mlp"    %in% names(methods)
 needs_tabpfn    <- "tabpfn" %in% names(methods)
@@ -71,13 +87,24 @@ base_pkgs <- c(
   "smotefamily", "stabm", "tidyverse", "vegan", "wordcloud", "wordcloud2",
   "yaml", "zCompositions"
 )
-torch_pkgs  <- if (needs_mlr3torch) "mlr3torch"                        else character()
-tabpfn_pkgs <- if (needs_tabpfn)    c("reticulate", "mlr3extralearners") else "mlr3extralearners"
+# Only load torch/reticulate when the corresponding method is actually selected,
+# to avoid triggering the torch download prompt or the conda env check.
+torch_pkgs  <- if (needs_mlr3torch) "mlr3torch"  else character()
+tabpfn_pkgs <- if (needs_tabpfn)    "reticulate" else character()
+
+# mlr3extralearners is only on GitHub (not CRAN), so it must be installed
+# separately before pacman::p_load tries to resolve it.
+if (!requireNamespace("remotes",          quietly = TRUE)) install.packages("remotes")
+if (!requireNamespace("mlr3extralearners", quietly = TRUE))
+  remotes::install_github("mlr-org/mlr3extralearners@*release",
+                           upgrade = "never", dependencies = TRUE)
 
 pkgs <- unique(c(base_pkgs, torch_pkgs, tabpfn_pkgs))
 do.call(pacman::p_load, c(as.list(pkgs), install = TRUE))
 
-# Solve known conflicts
+# Resolve name collisions between mlr3/tidyverse/compositions that all export
+# common generic names. Without this, R would use whichever was loaded last,
+# which can change silently between sessions.
 conflict_prefer("select",   "dplyr")
 conflict_prefer("filter",   "dplyr")
 conflict_prefer("rename",   "dplyr")
@@ -86,43 +113,58 @@ conflict_prefer("first",    "dplyr")
 conflict_prefer("var",      "compositions")
 conflict_prefer("progress", "httr")
 
-# Source helper scripts
-source(file.path(root, "R", "cfmdbench_data_helpers.R"))
-source(file.path(root, "R", "cfmdbench_training_helpers.R"))
-source(file.path(root, "R", "cfmdbench_scoring_helpers.R"))
+# Load the three helper scripts that define all cfmdbench_* functions.
+# These must be sourced AFTER packages are loaded (they depend on mlr3, dplyr, etc.).
+source(file.path(root, "R", "cfmdbench_data_helpers.R"))      # download + prepare data
+source(file.path(root, "R", "cfmdbench_training_helpers.R"))  # build learners + train
+source(file.path(root, "R", "cfmdbench_scoring_helpers.R"))   # benchmark + predict utilities
 
-# Configure optional backends (TabPFN / mlr3torch)
+# Configure optional backends after packages are loaded:
+#   TabPFN: sets HF_TOKEN, PYTORCH_CUDA_ALLOC_CONF, activates the conda env
+#           (name from TABPFN_ENV_NAME, default "cfmdbench-tabpfn-gpu").
+#   MLP:    installs R torch if needed; warns if CUDA is not available.
+# TabPFN and MLP are mutually exclusive (both try to initialise a CUDA context).
 cfmdbench_setup_backends(cfg, needs_tabpfn, needs_mlr3torch, root)
 ```
 
 #### Set Parameters
 
 ```{r parameters, echo=FALSE, message=FALSE, warning=FALSE}
+# Silence mlr3 and bbotk info-level messages during tuning.
+# These would otherwise flood the output with per-iteration status lines.
 lgr::get_logger("mlr3")$set_threshold("off")
 lgr::get_logger("bbotk")$set_threshold("off")
 
-# Execution settings from config
-seed         <- cfg$execution$seed
-kfold        <- cfg$execution$kfold
-repeats      <- cfg$execution$repeats
+# ── Execution settings (config.yaml → execution section) ──────────────────────
+seed         <- cfg$execution$seed        # global random seed for reproducibility
+kfold        <- cfg$execution$kfold       # outer CV folds (default 10)
+repeats      <- cfg$execution$repeats     # repetitions for repeated CV on small data
 num_threads  <- cfg$execution$num_threads %||% parallel::detectCores()
-num_jobs     <- kfold
-term_min     <- cfg$execution$term_min
-fast_tuning  <- cfg$execution$fast_tuning
-learner_fallback <- cfg$execution$learner_fallback
+num_jobs     <- kfold   # number of parallel future workers = one per CV fold
+term_min     <- cfg$execution$term_min    # tuning time budget per method (minutes)
+fast_tuning  <- cfg$execution$fast_tuning # TRUE = budget-based multi-fidelity tuning
+learner_fallback <- cfg$execution$learner_fallback  # TRUE = featureless fallback on error
 
 set.seed(seed)
+# Raise the future globals size limit to handle large objects (e.g. the full
+# dataset, preprocessing pipeline) crossing process boundaries during parallel CV.
 options(future.globals.maxSize = cfg$execution$future_globals_max_size_gb * 1024^3)
-handlers(global = TRUE)
+handlers(global = TRUE)   # enable progressr progress bars globally
 
-# Dataset settings
-ds     <- cfg$dataset$id
-ver    <- cfg$dataset$version
-target <- cfg$dataset$target
+# ── Dataset settings (config.yaml → dataset section) ──────────────────────────
+ds     <- cfg$dataset$id       # dataset identifier used in file names
+ver    <- cfg$dataset$version  # dataset version; also used as the GitHub ref for download
+target <- cfg$dataset$target   # column name of the outcome variable (default "category")
 
+# run_date identifies this analysis run; used in save_dir below.
+# If left blank in config.yaml it defaults to today's date.
 run_date <- cfg$dataset$run_date %||% ""
 if (!nzchar(run_date)) run_date <- as.character(Sys.Date())
 
+# save_dir stores all tuned models and tuning instances for this run.
+# Format: <date>_<dataset>_<version>_saved_learners/
+# A new directory is created if it does not exist; an existing one is reused
+# (allowing interrupted runs to be resumed without re-tuning finished methods).
 save_dir <- paste(run_date, ds, ver, "saved_learners", sep = "_")
 if (!dir.exists(save_dir)) {
   dir.create(save_dir, recursive = TRUE)
@@ -131,30 +173,48 @@ if (!dir.exists(save_dir)) {
   message("Using:   ", save_dir)
 }
 
-# Data source
+# ── Data source settings (config.yaml → data_source section) ──────────────────
+# cache_dir holds the downloaded TSV files; named by version to keep runs apart.
+# manifest_path records the GitHub SHA of each downloaded file so only changed
+# files are re-fetched on subsequent runs (SHA-based caching).
 cache_dir     <- file.path("cache_cFMD", ver)
 manifest_path <- file.path(cache_dir, paste0(ds, "_", ver, "_manifest.rds"))
 
-completeness_threshold <- cfg$data_source$completeness_threshold
-api_batch_size         <- cfg$data_source$api_batch_size
+completeness_threshold <- cfg$data_source$completeness_threshold  # min taxa sum per sample (%)
+api_batch_size         <- cfg$data_source$api_batch_size          # GitHub API batch size
 
-# Preprocessing
-min_samples_per_class <- cfg$preprocessing$min_samples_per_class
-samples_to_keep       <- cfg$preprocessing$samples_to_keep
-smote                 <- cfg$preprocessing$smote
-filtering             <- cfg$preprocessing$filtering
-selecting             <- cfg$preprocessing$selecting
+# ── Preprocessing settings (config.yaml → preprocessing section) ──────────────
+min_samples_per_class <- cfg$preprocessing$min_samples_per_class  # drop rare classes
+samples_to_keep       <- cfg$preprocessing$samples_to_keep        # per-class subsampling (1 = keep all)
+smote                 <- cfg$preprocessing$smote    # "smote", "blsmote", "adasyn", or "" (auto)
+filtering             <- cfg$preprocessing$filtering  # "minimal", "varcor", "infogain"
+selecting             <- cfg$preprocessing$selecting  # TRUE = run recursive feature selection
 
-# Visualisation
-downsample_n    <- cfg$visualisation$downsample_n
-prevalence_min  <- cfg$visualisation$prevalence_min
-shap_n_samples  <- cfg$visualisation$shap_n_samples
-shap_n_features <- cfg$visualisation$shap_n_features
+# ── Visualisation settings (config.yaml → visualisation section) ──────────────
+downsample_n    <- cfg$visualisation$downsample_n    # max samples for ordination plots
+prevalence_min  <- cfg$visualisation$prevalence_min  # min feature prevalence for ordination
+shap_n_samples  <- cfg$visualisation$shap_n_samples  # background dataset size for SHAP
+shap_n_features <- cfg$visualisation$shap_n_features # number of top features to show in SHAP plots
 ```
 
 #### Import Data
 
 ```{r import, echo=FALSE, message=FALSE, warning=FALSE}
+# cfmdbench_load_data() is the single entry point for all data fetching.
+# It calls the GitHub Contents API to list projects, downloads per-project
+# TSV files (with SHA-based caching — only changed files are re-fetched),
+# parses them with cfmdbench_parse_profile_tsv(), and assembles a tidy
+# sample × feature tibble via cfmdbench_prepare_data().
+#
+# Key config values used:
+#   cfg$data_source$repo  — GitHub repo slug (e.g. "SegataLab/cFMD")
+#   cfg$data_source$path  — sub-path inside the repo containing project folders
+#   ver (= cfg$dataset$version)  — Git ref / tag pinned for reproducibility
+#   completeness_threshold — drop samples whose taxa abundances sum < this %
+#   api_batch_size         — projects fetched per GitHub API round (rate limiting)
+#
+# Returns: a tibble with columns for each taxon (k__... prefix) and metadata
+# fields (category, type, subtype, sample). This is the raw, unfiltered table.
 tab_raw <- cfmdbench_load_data(
   repo                   = cfg$data_source$repo,
   data_path              = cfg$data_source$path,
@@ -165,7 +225,9 @@ tab_raw <- cfmdbench_load_data(
   batch_size             = api_batch_size
 )
 
-# Plot samples whose taxa sum deviates from 100
+# Quality check: flag samples whose relative abundances don't sum to ~100%.
+# These can arise from poor sequencing depth or data export artefacts.
+# The plot helps decide whether to tighten completeness_threshold.
 sample_cols     <- grep("^k__", names(tab_raw), value = TRUE)
 taxa_wide       <- tab_raw[, sample_cols]
 col_sums_all    <- colSums(
@@ -193,6 +255,10 @@ if (length(bad_samples)) {
 #### Visualize Data I
 
 ```{r visualize, echo=FALSE, message=FALSE, warning=FALSE}
+# Exploratory plots of the raw dataset before any filtering:
+# sample counts per category, types per category, and a cheese word cloud.
+# These help assess dataset composition and class imbalance at a glance.
+
 # Count observations per category
 category_counts <- tab_raw %>%
   group_by(category) %>%
@@ -260,7 +326,9 @@ wordcloud(
 #### Pre-Process I
 
 ```{r preprocess1, echo=FALSE, message=FALSE, warning=FALSE}
-# Convert to correct types and keep sample + target + microbial features
+# Convert taxa columns to numeric, cast the target to factor, and restrict to
+# the three column types that downstream code expects: sample ID, target, and
+# taxa (k__...). Metadata columns (type, subtype, etc.) are dropped here.
 tab <- tab_raw %>%
   mutate(across(starts_with("k__"), as.numeric)) %>%
   mutate(
@@ -271,9 +339,15 @@ tab <- tab_raw %>%
   ) %>%
   select(sample, !!as.symbol(target), starts_with("k__"))
 
+# Rename the target column to the generic name "target" so mlr3 task creation
+# is consistent regardless of what the column is called in config.yaml.
 names(tab)[names(tab) == target] <- "target"
 
-# Filter classes by minimum sample size
+# Filter out rare classes (< min_samples_per_class from preprocessing$min_samples_per_class)
+# and optionally subsample each class to samples_to_keep fraction
+# (from preprocessing$samples_to_keep; 1 = keep all samples).
+# droplevels() removes empty factor levels left by the filter so mlr3 doesn't
+# see ghost classes with zero samples.
 tab <- tab %>%
   group_by(target) %>%
   mutate(n = n()) %>%
@@ -284,7 +358,14 @@ tab <- tab %>%
   as.data.frame() %>%
   droplevels()
 
-# Determine classification type and metrics
+# Determine classification type (binary or multi-class) and set the
+# corresponding evaluation metrics used throughout the notebook:
+#   dataset_attr    — "binary" or "multi-class"; controls XGBoost eval metrics
+#                     and which benchmark measures are computed.
+#   bmr_measures    — full metric set for the outer benchmark (reported in tables).
+#   train_measures  — inner CV metrics used during tuning (bacc + logloss for both).
+#   positive_class  — for binary tasks, the minority class is treated as positive
+#                     (relevant for precision, recall, AUC, PR-AUC).
 positive_class <- ""
 if (length(levels(tab$target)) > 2L) {
   dataset_attr  <- "multi-class"
@@ -306,17 +387,25 @@ if (length(levels(tab$target)) > 2L) {
 cat("\nClassification type:", dataset_attr, "\n")
 cat("Evaluation metrics: ", paste(train_measures, collapse = ", "), "\n")
 
+# Replace pipe characters in column names (QIIME-style lineages use "|" as
+# separator) with underscores, which are safe in mlr3 column names.
 tab %<>% rename_with(~ gsub("\\|", "_", .))
-tab %<>% sample_frac(size = 1)
+tab %<>% sample_frac(size = 1)  # shuffle row order before splitting
 ```
 
 #### Visualize Data II
 
 ```{r visualize2, echo=FALSE, message=FALSE, warning=FALSE}
+# Ordination helper: CLR-transforms the abundance matrix, applies optional
+# downsampling (downsample_n from visualisation$downsample_n), and filters
+# features by prevalence (prevalence_min from visualisation$prevalence_min).
+# CLR (centred log-ratio) is the standard transformation for compositional data
+# because it maps from the simplex to Euclidean space, making PCA/t-SNE valid.
 .make_ordination_df <- function(tab_in, downsample_n, prevalence_min) {
   df        <- as_tibble(tab_in) %>% mutate(target = str_replace_all(target, "_", " "))
   taxa_cols <- setdiff(names(df), c("target", "sample"))
 
+  # Shorten taxon names to species or genus level for readable plot labels.
   shorten_one <- function(n) {
     if (grepl("s__", n)) return(sub(".*(s__.*)$", "\\1", n))
     if (grepl("g__", n)) return(sub(".*(g__.*)$", "\\1", n))
@@ -328,16 +417,22 @@ tab %<>% sample_frac(size = 1)
   y <- df$target
   X <- df[, !(names(df) %in% c("target", "sample")), drop = FALSE]
 
+  # Subsample for speed: PCA/t-SNE on thousands of samples is slow.
   if (nrow(X) > downsample_n) {
     idx <- sample(seq_len(nrow(X)), downsample_n)
     X <- X[idx, , drop = FALSE]; y <- y[idx]
   }
 
+  # Remove features present in fewer than prevalence_min fraction of samples
+  # (rare taxa add noise to ordination without contributing signal), and remove
+  # zero-variance features (these would cause CLR to produce NaN).
   prev <- colMeans(X > 0)
   X    <- X[, prev >= prevalence_min,    drop = FALSE]
   X    <- X[, apply(X, 2L, var) > 0,    drop = FALSE]
   if (!ncol(X)) stop("All features filtered; lower prevalence_min.")
 
+  # Replace zero counts with small imputed values (CZM = count zero multiplicative)
+  # before CLR. Zero counts are undefined under log-transformation.
   X0    <- zCompositions::cmultRepl(as.matrix(X), label = 0, method = "CZM",
                                     z.warning = 1, z.delete = FALSE)
   X_clr <- compositions::clr(X0)
@@ -346,7 +441,7 @@ tab %<>% sample_frac(size = 1)
 
 ord <- .make_ordination_df(tab, downsample_n, prevalence_min)
 
-# PCA
+# PCA on CLR-transformed abundances
 pca    <- prcomp(ord$X_clr, scale. = TRUE)
 scores <- data.frame(PC1 = pca$x[, 1L], PC2 = pca$x[, 2L], target = ord$y)
 
@@ -362,7 +457,7 @@ ggplot(scores, aes(PC1, PC2, fill = target)) +
 
 fviz_contrib(pca, choice = "var", axes = 1:2, top = 10L)
 
-# Elbow plot
+# Elbow plot: find the number of components that explain 90% of variance.
 cum_var      <- cumsum(pca$sdev^2 / sum(pca$sdev^2))
 n_comp_90    <- which(cum_var >= 0.9)[1L]
 cat("Components explaining 90% variance:", n_comp_90, "\n")
@@ -376,7 +471,9 @@ ggplot(data.frame(k = seq_along(cum_var), v = cum_var), aes(k, v)) +
        subtitle = "Reference line: 90% variance threshold",
        x = "Number of components", y = "Cumulative proportion of variance")
 
-# t-SNE
+# t-SNE on CLR-transformed abundances for non-linear structure.
+# Perplexity is capped at 30 and also bounded by (n-1)/3 to satisfy the
+# t-SNE requirement that perplexity < n/3.
 perplexity <- pmin(30L, floor((nrow(ord$X_clr) - 1L) / 3L))
 ts <- Rtsne::Rtsne(ord$X_clr, pca = TRUE, check_duplicates = FALSE,
                    perplexity = perplexity, theta = 0.5, num_threads = 8L)
@@ -394,6 +491,10 @@ ggplot(ts_df, aes(tSNE1, tSNE2, fill = target)) +
 #### Define Task
 
 ```{r task, echo=FALSE, message=FALSE, warning=FALSE}
+# Build the mlr3 classification task from the preprocessed table.
+# mlr3 requires a primary key column that uniquely identifies each row.
+# We handle the edge case where sample IDs are duplicated across projects by
+# creating a unique sample_id column in that situation.
 tab$sample <- trimws(as.character(tab$sample))
 stopifnot("sample" %in% names(tab), "target" %in% names(tab))
 
@@ -406,20 +507,30 @@ if (anyDuplicated(tab$sample)) {
   id_col <- "sample"
 }
 
+# as_data_backend with an integer primary key avoids mlr3 reordering the rows.
 backend  <- mlr3::as_data_backend(tab, primary_key = seq_len(nrow(tab)))
 task     <- mlr3::as_task_classif(backend, target = "target")
+# Remove sample from the feature set so it is not used as a predictor.
 task$set_col_roles("sample", roles = character())
 
+# Stratified 80/20 split: stratification ensures each class is proportionally
+# represented in both train and test sets. task_train is used for all tuning
+# and benchmarking; task_test is the held-out evaluation set.
 split      <- mlr3::partition(task, ratio = 0.8)
 task_train <- task$clone(deep = TRUE)$filter(split$train)
 task_test  <- task$clone(deep = TRUE)$filter(split$test)
 
+# For binary tasks, set the positive class (the minority class by default).
+# This determines which class is used as "positive" for precision, recall,
+# and AUC calculations.
 if (dataset_attr == "binary") {
   task$positive       <- positive_class
   task_train$positive <- positive_class
   task_test$positive  <- positive_class
 }
 
+# Add "stratum" role to target so mlr3 stratifies all resampling operations
+# (tuning, benchmark CV) by class, preserving class ratios in each fold.
 task$set_col_roles("target",       c("target", "stratum"))
 task_train$set_col_roles("target", c("target", "stratum"))
 task_test$set_col_roles("target",  c("target", "stratum"))
@@ -428,7 +539,7 @@ task_test$set_col_roles("target",  c("target", "stratum"))
 #### Pre-Process II
 
 ```{r preprocess2, echo=FALSE, message=FALSE, warning=FALSE}
-# Class distribution
+# Compute class distribution statistics to guide the SMOTE decision.
 class_counts    <- table(task_train$data()$target)
 majority_class  <- names(which.max(class_counts))
 minority_class  <- names(which.min(class_counts))
@@ -450,7 +561,11 @@ ggplot(class_counts_df, aes(x = reorder(target, count, decreasing = TRUE),
   theme(plot.title = element_text(face = "bold", hjust = 0.5),
         axis.text.x = element_text(angle = 45, hjust = 1))
 
-# SMOTE decision
+# ── SMOTE decision ─────────────────────────────────────────────────────────────
+# Apply oversampling if the imbalance ratio exceeds 1.5:1 AND all classes have
+# enough samples. The threshold is fixed here (not in config) because it reflects
+# a general best practice rather than a dataset-specific choice.
+# cfg$preprocessing$smote can force a specific method or leave it on "auto" ("").
 imbalance_threshold <- 1.5
 apply_smote <- imbalance_ratio > imbalance_threshold &&
                all(class_counts >= min_samples_per_class)
@@ -459,7 +574,24 @@ if (!nzchar(smote)) smote <- if (apply_smote) "smote" else "none"
 if (!apply_smote)   smote <- "none"
 cat("SMOTE decision:", smote, "\n")
 
-# Build preprocessing pipeline
+# ── Preprocessing pipeline ─────────────────────────────────────────────────────
+# The pipeline is built as a sequence of PipeOps connected with %>>%.
+# It is assembled here but NOT trained yet — training happens inside each
+# learner's cross-validation folds to avoid data leakage.
+#
+# "filtering" (cfg$preprocessing$filtering) controls which feature filters are applied:
+#   "varcor"    — remove near-zero variance features, then correlated features (Spearman)
+#   "minimal" / TRUE / selecting=TRUE — only robustify (impute NAs, fix factor levels) + scale
+#   "infogain"  — information-gain based feature filter (tuned fraction in search space)
+#   anything else — no preprocessing (just a passthrough nop)
+#
+# All pipelines except "nop" end with po("scale") to centre and standardise
+# features. This is important for distance-based methods (SVM, kNN, LDA).
+#
+# When selecting=TRUE (recursive feature selection), filtering is forced to
+# "minimal" because RFE already performs implicit feature selection — adding a
+# variance/correlation filter on top would be redundant and could remove
+# features before RFE can evaluate their importance.
 if (selecting) filtering <- "minimal"
 
 preprocessing_pipe <- if (filtering == "varcor") {
@@ -491,6 +623,9 @@ if (!isFALSE(filtering)) {
   preprocessing_pipe <- preprocessing_pipe %>>% mlr3pipelines::po("scale", center = TRUE)
 }
 
+# Optionally append a SMOTE oversampling step to address class imbalance.
+# Three variants are supported: standard SMOTE, Borderline SMOTE, and ADASYN.
+# The SMOTE parameters (K, dup_size) are added to the tuning search space below.
 smote_pipe <- NULL
 if (apply_smote && smote %in% c("smote", "blsmote", "adasyn")) {
   smote_pipe <- switch(smote,
@@ -504,7 +639,10 @@ if (!is.null(smote_pipe)) {
   preprocessing_pipe <- preprocessing_pipe %>>% smote_pipe
 }
 
-# Remove lazy_tensor from all PipeOps (mlr3torch safety)
+# Safety patch for mlr3torch compatibility: when mlr3torch is loaded it adds
+# "lt" (lazy_tensor) to the feature_types of every registered PipeOp, including
+# the ones in our preprocessing pipeline. This causes non-MLP learners to fail
+# because they don't know how to handle lazy_tensor inputs. We strip it here.
 for (po_name in names(preprocessing_pipe$pipeops)) {
   po_obj <- preprocessing_pipe$pipeops[[po_name]]
   priv   <- po_obj$.__enclos_env__$private
@@ -516,7 +654,10 @@ for (po_name in names(preprocessing_pipe$pipeops)) {
 
 cat("\nFinal preprocessing pipeline:\n"); print(preprocessing_pipe)
 
-# Preprocessing search space parameters
+# ── Preprocessing search space parameters ─────────────────────────────────────
+# These are the tunable parts of the preprocessing pipeline. They are merged
+# into each learner's search space inside cfmdbench_get_search_space() so that
+# filter fractions and SMOTE settings are optimised jointly with model parameters.
 preproc_params <- list()
 if (filtering == "varcor") {
   preproc_params <- c(preproc_params, list(
@@ -544,43 +685,27 @@ if (!is.null(smote_pipe)) {
 #### Feature Selection
 
 ```{r feature_selection, echo=FALSE, message=FALSE, warning=FALSE}
-future::plan(future::sequential)
-future::plan(future::multisession, workers = num_jobs)
-
+# Feature selection thresholds from config.yaml → feature_selection section:
+#   num_col: if ncol < num_col, target n_features = 2 (too few features to
+#            justify a large selection); otherwise n_features = 10.
+#   num_row: if nrow > num_row, use "simple" (single-learner RFE, faster);
+#            otherwise use "ensemble" (four learners, more robust but slower).
 num_col <- cfg$feature_selection$num_col
 num_row <- cfg$feature_selection$num_row
 
+# Cache file for the selected feature set. Persisted to save_dir alongside the
+# tuned models so that an R session restart does not force a full RFE redo.
+# Delete this file (and re-run the chunk) to force a fresh feature selection.
+fs_cache_file <- file.path(save_dir, "selected_features.rds")
+
 if (selecting) {
-  n_features <- if (task_train$ncol < num_col) 2L else 10L
-  fs_method  <- if (task_train$nrow > num_row) "simple" else "ensemble"
 
-  rfe       <- mlr3fselect::fs("rfe", n_features = n_features, feature_fraction = 0.8)
-  svm_rfe   <- mlr3fselect::clbk("mlr3fselect.svm_rfe")
-  one_se    <- mlr3fselect::clbk("mlr3fselect.one_se_rule")
-
-  max_nrounds  <- 500L
-  internal_ss  <- paradox::ps(nrounds = paradox::p_int(
-    upper = max_nrounds,
-    aggr  = function(x) as.integer(mean(unlist(x)))
-  ))
-  xgb_clbk <- mlr3fselect::clbk("mlr3fselect.internal_tuning",
-                                  internal_search_space = internal_ss)
-
-  fs_rpart   <- mlr3::lrn("classif.rpart")
-  fs_ranger  <- mlr3::lrn("classif.ranger",  importance = "permutation")
-  fs_svm     <- mlr3::lrn("classif.svm",     type = "C-classification", kernel = "linear")
-  fs_xgboost <- mlr3::lrn("classif.xgboost", nrounds = max_nrounds,
-                            early_stopping_rounds = 10L)
-  mlr3::set_validate(fs_xgboost, 0.2)
-  mlr3::set_threads(fs_ranger,  n = ceiling(num_threads / 5L))
-  mlr3::set_threads(fs_xgboost, n = ceiling(num_threads / 5L))
-
-  fs_rpart$id   <- "rpart"
-  fs_ranger$id  <- "rf"
-  fs_svm$id     <- "svm"
-  fs_xgboost$id <- "xgboost"
-
-  # Robustify tasks before FS
+  # ── Robustify tasks ──────────────────────────────────────────────────────────
+  # Applied in both the cached and fresh-run paths because task_train / task_test
+  # are always rebuilt from scratch after a session restart. The robustify step
+  # is fast and deterministic — re-running it is cheap.
+  # Note: the training pipeline (preprocess2 chunk) will apply robustify again
+  # internally inside each CV fold to avoid data leakage. That is intentional.
   robust_pipe <- mlr3pipelines::ppl("robustify") %>>%
     mlr3pipelines::po("colapply", applicator = as.numeric,
                       affect_columns = mlr3pipelines::selector_type(
@@ -589,65 +714,144 @@ if (selecting) {
   task_train <- robust_pipe$predict(task_train)[[1L]]
   task_test  <- robust_pipe$predict(task_test)[[1L]]
 
-  if (fs_method == "ensemble") {
-    efs <- mlr3fselect::ensemble_fselect(
-      fselector          = rfe,
-      task               = task_train,
-      learners           = list(fs_rpart, fs_ranger, fs_svm, fs_xgboost),
-      init_resampling    = mlr3::rsmp("subsampling", repeats = 50L, ratio = 0.8),
-      inner_resampling   = mlr3::rsmp("cv", folds = 5L),
-      inner_measure      = mlr3::msr("classif.ce"),
-      measure            = mlr3::msr("classif.bacc"),
-      terminator         = mlr3tuning::trm("none"),
-      callbacks          = list(
-        rpart   = list(one_se),
-        rf      = list(one_se),
-        svm     = list(one_se, svm_rfe),
-        xgboost = list(one_se, xgb_clbk)
-      ),
-      store_benchmark_result = FALSE
-    )
+  # ── Resume from cache ────────────────────────────────────────────────────────
+  if (file.exists(fs_cache_file)) {
+    selected_feats <- readRDS(fs_cache_file)
+    message("Feature selection: loaded ", length(selected_feats),
+            " cached features from ", fs_cache_file)
+    message("Delete ", fs_cache_file, " and re-run this chunk to redo selection.")
 
-    print(efs); head(efs$result)
-    print(autoplot(efs, type = "performance",  theme = theme_minimal(base_size = 14)))
-    print(autoplot(efs, type = "n_features",   theme = theme_minimal(base_size = 14)))
-    print(autoplot(efs, type = "pareto",       theme = theme_minimal(base_size = 14)))
-    print(autoplot(efs, type = "pareto", pareto_front = "estimated",
-                   theme = theme_minimal(base_size = 14)) +
-          scale_color_brewer(palette = "Set1") + labs(title = "Estimated Pareto front"))
+  } else {
+    # ── Full RFE run ───────────────────────────────────────────────────────────
+    # Spin up workers only when actually needed — cache hit skips this.
+    future::plan(future::sequential)
+    future::plan(future::multisession, workers = num_jobs)
 
-    kp <- efs$knee_points(type = "estimated")
-    n_feat <- if (is.na(kp$n_features)) {
-      message("Estimated knee point NA — using median feature count.")
-      median(efs$result$n_features, na.rm = TRUE)
+    n_features <- if (task_train$ncol < num_col) 2L else 10L
+    fs_method  <- if (task_train$nrow > num_row) "simple" else "ensemble"
+
+    # Recursive Feature Elimination: at each step removes the worst 20% of
+    # remaining features (feature_fraction = 0.8) until n_features remain.
+    rfe     <- mlr3fselect::fs("rfe", n_features = n_features, feature_fraction = 0.8)
+
+    # svm_rfe callback: SVM has no native variable importance, so this callback
+    # computes permutation importance externally to guide RFE. This generates
+    # the "Computing permutation importance..." messages during selection.
+    svm_rfe <- mlr3fselect::clbk("mlr3fselect.svm_rfe")
+
+    # one_se_rule callback: applies the one-standard-error rule to prefer sparser
+    # feature sets — i.e. pick the simplest model whose CV score is within one SE
+    # of the best. Reduces overfitting to the feature selection data.
+    one_se  <- mlr3fselect::clbk("mlr3fselect.one_se_rule")
+
+    # internal_tuning callback for XGBoost: lets XGBoost use early stopping to
+    # automatically determine the optimal nrounds during feature selection, rather
+    # than fixing it to a single value. Adds nrounds to the internal search space.
+    max_nrounds  <- 500L
+    internal_ss  <- paradox::ps(nrounds = paradox::p_int(
+      upper = max_nrounds,
+      aggr  = function(x) as.integer(mean(unlist(x)))
+    ))
+    xgb_clbk <- mlr3fselect::clbk("mlr3fselect.internal_tuning",
+                                    internal_search_space = internal_ss)
+
+    # Four learners used for feature selection — lightweight configurations
+    # designed to evaluate feature subsets quickly, not for final prediction.
+    fs_rpart   <- mlr3::lrn("classif.rpart")
+    fs_ranger  <- mlr3::lrn("classif.ranger",  importance = "permutation")
+    fs_svm     <- mlr3::lrn("classif.svm",     type = "C-classification", kernel = "linear")
+    fs_xgboost <- mlr3::lrn("classif.xgboost", nrounds = max_nrounds,
+                              early_stopping_rounds = 10L)
+    mlr3::set_validate(fs_xgboost, 0.2)   # XGBoost needs a validation split for early stopping
+    mlr3::set_threads(fs_ranger,  n = ceiling(num_threads / 5L))
+    mlr3::set_threads(fs_xgboost, n = ceiling(num_threads / 5L))
+
+    fs_rpart$id   <- "rpart"
+    fs_ranger$id  <- "rf"
+    fs_svm$id     <- "svm"
+    fs_xgboost$id <- "xgboost"
+
+    if (fs_method == "ensemble") {
+      # Ensemble feature selection: runs RFE independently with each of the four
+      # learners across 50 subsampling repetitions (80% of rows each time) and
+      # aggregates the results into a consensus feature ranking.
+      # init_resampling = 50 subsampling repeats: produces a stability estimate
+      # (Jaccard index) showing how consistently features are selected.
+      # The consensus features are chosen by the knee point of the Pareto front
+      # (performance vs. number of features) using the "estimated" method.
+      efs <- mlr3fselect::ensemble_fselect(
+        fselector          = rfe,
+        task               = task_train,
+        learners           = list(fs_rpart, fs_ranger, fs_svm, fs_xgboost),
+        init_resampling    = mlr3::rsmp("subsampling", repeats = 50L, ratio = 0.8),
+        inner_resampling   = mlr3::rsmp("cv", folds = 5L),
+        inner_measure      = mlr3::msr("classif.ce"),
+        measure            = mlr3::msr("classif.bacc"),
+        terminator         = mlr3tuning::trm("none"),
+        callbacks          = list(
+          rpart   = list(one_se),
+          rf      = list(one_se),
+          svm     = list(one_se, svm_rfe),
+          xgboost = list(one_se, xgb_clbk)
+        ),
+        store_benchmark_result = FALSE
+      )
+
+      print(efs); head(efs$result)
+      print(autoplot(efs, type = "performance",  theme = theme_minimal(base_size = 14)))
+      print(autoplot(efs, type = "n_features",   theme = theme_minimal(base_size = 14)))
+      print(autoplot(efs, type = "pareto",       theme = theme_minimal(base_size = 14)))
+      print(autoplot(efs, type = "pareto", pareto_front = "estimated",
+                     theme = theme_minimal(base_size = 14)) +
+            scale_color_brewer(palette = "Set1") + labs(title = "Estimated Pareto front"))
+
+      # Knee point: the inflection in the performance–complexity trade-off curve
+      # where adding more features yields diminishing returns.
+      kp <- efs$knee_points(type = "estimated")
+      n_feat <- if (is.na(kp$n_features)) {
+        message("Estimated knee point NA — using median feature count.")
+        median(efs$result$n_features, na.rm = TRUE)
+      } else {
+        message("Estimated knee point: ", kp$n_features, " features.")
+        kp$n_features
+      }
+
+      # Stability: how consistently are the same features selected across repeats?
+      # A high Jaccard index (close to 1) means the selected set is robust.
+      global_stab <- efs$stability("jaccard", global = TRUE)
+      message("Global stability (Jaccard): ", global_stab)
+      print(efs$stability("jaccard", global = FALSE))
+      print(autoplot(efs, type = "stability", theme = theme_minimal(base_size = 14)) +
+            scale_fill_brewer(palette = "Set1"))
+
+      # Consensus feature ranking using average votes (weighted by learner performance).
+      consensus_av  <- efs$feature_ranking(method = "av", committee_size = n_feat,
+                                            use_weights = TRUE)
+      selected_feats <- consensus_av$feature
+      print(consensus_av)
     } else {
-      message("Estimated knee point: ", kp$n_features, " features.")
-      kp$n_features
+      # Simple feature selection: single Random Forest with 5-fold CV.
+      # Faster than ensemble but less stable for small datasets.
+      fsi_obj <- mlr3fselect::fsi(
+        task       = task_train,
+        learner    = fs_ranger,
+        resampling = mlr3::rsmp("cv", folds = 5L),
+        measure    = mlr3::msr("classif.bacc"),
+        terminator = mlr3tuning::trm("none")
+      )
+      rfe$optimize(fsi_obj)
+      print(data.table::as.data.table(fsi_obj$result)[, .(features, classif.bacc)])
+      selected_feats <- fsi_obj$result_feature_set
     }
 
-    global_stab <- efs$stability("jaccard", global = TRUE)
-    message("Global stability (Jaccard): ", global_stab)
-    print(efs$stability("jaccard", global = FALSE))
-    print(autoplot(efs, type = "stability", theme = theme_minimal(base_size = 14)) +
-          scale_fill_brewer(palette = "Set1"))
-
-    consensus_av  <- efs$feature_ranking(method = "av", committee_size = n_feat,
-                                          use_weights = TRUE)
-    selected_feats <- consensus_av$feature
-    print(consensus_av)
-  } else {
-    fsi_obj <- mlr3fselect::fsi(
-      task       = task_train,
-      learner    = fs_ranger,
-      resampling = mlr3::rsmp("cv", folds = 5L),
-      measure    = mlr3::msr("classif.bacc"),
-      terminator = mlr3tuning::trm("none")
-    )
-    rfe$optimize(fsi_obj)
-    print(data.table::as.data.table(fsi_obj$result)[, .(features, classif.bacc)])
-    selected_feats <- fsi_obj$result_feature_set
+    # Save selected features to disk so a session restart doesn't require
+    # re-running the full RFE. Stored in save_dir alongside tuned models.
+    saveRDS(selected_feats, fs_cache_file)
+    message("Feature selection: saved ", length(selected_feats),
+            " features to ", fs_cache_file)
   }
 
+  # Restrict both tasks to the selected feature subset before training.
   task_train$select(selected_feats)
   task_test$select(selected_feats)
 }
@@ -656,6 +860,9 @@ if (selecting) {
 #### Visualize Data III
 
 ```{r visualize3, echo=FALSE, message=FALSE, warning=FALSE}
+# Repeat the ordination plots on the post-feature-selection dataset.
+# Comparing these with the pre-selection plots shows whether selected features
+# preserve the main sources of variation in the data.
 if (selecting) {
   ord_post <- .make_ordination_df(task_train$data(), downsample_n, prevalence_min)
 
@@ -691,10 +898,41 @@ if (selecting) {
 #### Train Models
 
 ```{r train, echo=FALSE, message=FALSE, warning=FALSE}
+# Reset future plan before starting the training parallel loop.
 future::plan(future::sequential)
 future::plan(future::multisession, workers = num_jobs)
 
-base_learners   <- cfmdbench_build_learners(seed = seed, kfold = kfold)
+# cfmdbench_build_learners() (R/cfmdbench_training_helpers.R):
+#   Creates the base mlr3 Learner objects for all selected methods.
+#   No training happens here — these are plain learner specs that get cloned
+#   and wrapped in preprocessing pipelines inside cfmdbench_train_methods().
+#   Passing methods = names(methods) prevents unnecessary construction of
+#   MLP/TabPFN objects when those methods are not selected.
+base_learners <- cfmdbench_build_learners(seed = seed, kfold = kfold,
+                                           methods = names(methods))
+
+# cfmdbench_train_methods() (R/cfmdbench_training_helpers.R):
+#   The main training loop. For each method it:
+#     1. Assembles the full pipeline: preprocessing_pipe → learner
+#     2. Runs inner-CV tuning using the search space from cfmdbench_get_search_space()
+#        with the tuner from cfmdbench_get_tuner() and terminator from
+#        cfmdbench_get_terminator()
+#     3. Picks the best hyperparameters (highest bacc, then lowest logloss)
+#     4. Trains the final model on the full task_train
+#     5. Saves <method>_tuned_instance.rds (tuning history) and
+#        <method>_tuned_learner.rds (final trained model) to save_dir
+#   Methods with an existing completed instance on disk are skipped,
+#   allowing interrupted runs to be resumed without re-tuning.
+#
+# Key config values used by this function:
+#   execution$kfold        → inner CV folds
+#   execution$repeats      → repeated CV repetitions for small datasets
+#   execution$num_threads  → total threads; divided among parallel jobs
+#   execution$term_min     → tuning time budget per method (minutes)
+#   execution$fast_tuning  → multi-fidelity tuning with budget parameters
+#   execution$learner_fallback → featureless fallback on learner error
+#
+# Returns: named list of trained GraphLearner objects (also on disk in save_dir).
 trained_learners <- cfmdbench_train_methods(
   methods           = methods,
   base_learners     = base_learners,
@@ -717,12 +955,19 @@ trained_learners <- cfmdbench_train_methods(
 #### Benchmark
 
 ```{r benchmark, echo=FALSE, message=FALSE, warning=FALSE}
+# The benchmark chunk re-evaluates every tuned model using k-fold CV on task_train.
+# This is separate from the test-set prediction (next chunk) and gives a more
+# reliable estimate of generalisation by averaging across multiple train/val splits.
 measure <- c(accuracy = "classif.acc")
 
 future::plan(future::sequential)
 future::plan(future::multisession, workers = num_jobs)
 
-# Load / prepare learners for benchmarking
+# Choose benchmark resampling strategy:
+#   bootstrap (if the smallest class has <= kfold samples): avoids empty test
+#              strata that would crash stratified k-fold CV.
+#   cv        (otherwise): standard k-fold is preferred when class sizes allow it.
+# The 10 bootstrap repetitions match the kfold default to keep compute comparable.
 min_count <- task_train$data() %>%
   dplyr::count(target) %>% dplyr::pull(n) %>% min()
 
@@ -732,10 +977,22 @@ benchmark_resampling <- if (min_count <= kfold) {
   mlr3::rsmp("cv", folds = kfold)
 }
 
+# cfmdbench_load_benchmark_learners() (R/cfmdbench_scoring_helpers.R):
+#   Loads each learner from trained_learners (in-memory, preferred) or from
+#   <method>_tuned_learner.rds on disk (fallback for methods not in this session).
+#   Also: unmarshals MLP models (reverses the tensor→raw-bytes serialisation),
+#   sets threads = 1 (benchmark runs learners in parallel at the outer level),
+#   and re-trains each learner on task_train to ensure graph state is current.
 learners_best <- cfmdbench_load_benchmark_learners(
   methods, trained_learners, save_dir, task_train)
 
-# Preprocessing summaries
+# cfmdbench_get_preproc_summary() (R/cfmdbench_scoring_helpers.R):
+#   Inspects the trained pipeline's internal PipeOp outputs to report:
+#     - how many features survived preprocessing (after SMOTE / scale)
+#     - the class distribution as seen by the learner (post-SMOTE if applied)
+#   This requires keep_results = TRUE (set in cfmdbench_configure_final_learner).
+#   The `after` argument identifies which PipeOp to inspect: "smote" when
+#   SMOTE was applied, "scale" otherwise.
 for (method in names(learners_best)) {
   summary <- suppressWarnings(
     cfmdbench_get_preproc_summary(learners_best[[method]],
@@ -752,7 +1009,9 @@ for (method in names(learners_best)) {
   }
 }
 
-# Run benchmark
+# Run benchmark: evaluates all learners using the same resampling design so
+# results are directly comparable. mlr3::benchmark() runs each learner ×
+# each fold in parallel (managed by the future plan set above).
 start_bmr <- Sys.time()
 cat("Benchmark start:", format(start_bmr, "%Y-%m-%d %H:%M:%S"), "\n")
 bmr <- mlr3::benchmark(
@@ -761,7 +1020,7 @@ cat("Benchmark done: ", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
 cat("Time:", round(as.numeric(difftime(Sys.time(), start_bmr, units = "mins")), 2),
     "minutes\n")
 
-# Autoplot
+# Box plot of CV accuracy per method
 autoplot(bmr, measure = mlr3::msr(measure[[1L]])) +
   labs(x = "Method", y = paste(names(measure[1L]), "measure")) +
   scale_x_discrete(labels = as.character(unlist(methods))) +
@@ -771,11 +1030,15 @@ autoplot(bmr, measure = mlr3::msr(measure[[1L]])) +
         axis.title  = element_text(size = 16),
         plot.title  = element_text(size = 18, hjust = 0.5))
 
-# Summary table
+# cfmdbench_format_bench_df() (R/cfmdbench_scoring_helpers.R):
+#   Converts the mlr3 BenchmarkResult aggregate to a tidy data.frame:
+#   drops bookkeeping columns, translates mlr3 metric IDs to human-readable
+#   names (e.g. "classif.bacc" → "balanced accuracy"), and rounds to 4 decimal places.
+#   bmr_measures is the metric vector set in preprocess1 (differs for binary vs multi-class).
 bench_df <- cfmdbench_format_bench_df(bmr, bmr_measures)
 print(bench_df %>% select(-learner_id))
 
-# Dodged barplot
+# Dodged barplot comparing accuracy, balanced accuracy, and logloss
 bench_long <- bench_df %>%
   select(method, accuracy, `balanced accuracy`, logloss) %>%
   pivot_longer(c(accuracy, `balanced accuracy`, logloss),
@@ -797,12 +1060,16 @@ ggplot(bench_long, aes(x = method, y = value, fill = measure)) +
         axis.title  = element_text(size = 16),
         plot.title  = element_text(size = 18))
 
-# Best model
+# Identify the best model: highest balanced accuracy, then lowest logloss.
+# best_model_id is the learner_id (internal GraphLearner ID, e.g. "ranger");
+# best_method is the human-readable label (e.g. "Random Forest").
+# These are used in the prediction and importance chunks below.
 best_row      <- bench_df %>% arrange(desc(`balanced accuracy`), logloss) %>% slice(1L)
 best_model_id <- best_row$learner_id
 best_method   <- best_row$method
 
-# Average fold-wise predictions for best model
+# Average fold-wise predictions for the best model to summarise training-set
+# performance. Each sample appears in exactly one test fold per CV run.
 pred_dt    <- data.table::as.data.table(bmr$score())
 best_preds <- pred_dt[stringr::str_detect(learner_id, best_model_id)]
 all_preds  <- best_preds$prediction_test %>%
@@ -810,6 +1077,7 @@ all_preds  <- best_preds$prediction_test %>%
 prob_cols  <- grep("^prob\\.", names(all_preds), value = TRUE)
 
 if (length(prob_cols) == 2L) {
+  # Binary: average the positive-class probability across folds, then threshold.
   positive_col <- paste0("prob.", positive_class)
   avg_preds <- all_preds %>%
     group_by(row_ids) %>%
@@ -822,6 +1090,7 @@ if (length(prob_cols) == 2L) {
       correct  = response == truth
     )
 } else {
+  # Multi-class: take the class with the highest average probability.
   avg_preds <- all_preds %>%
     group_by(row_ids) %>%
     summarise(
@@ -874,18 +1143,23 @@ p3 <- ggplot(avg_preds, aes(x = truth, y = response, color = correct)) +
 #### Prediction
 
 ```{r prediction, echo=FALSE, message=FALSE, warning=FALSE}
+# Evaluate each tuned model on the held-out test set (task_test = 20% of data).
+# This is a single prediction per model — no resampling — giving an unbiased
+# estimate of generalisation performance on data the model has never seen.
 predictions <- list()
 
 for (method in names(methods)) {
   best_model <- learners_best[[method]]
 
+  # Fall back to disk if the model wasn't loaded in the benchmark chunk
+  # (e.g. if this chunk is run in a fresh session).
   if (is.null(best_model)) {
     path <- file.path(save_dir, paste0(method, "_tuned_learner.rds"))
     if (!file.exists(path)) {
       cat("SKIP:", method, "— no tuned learner found.\n"); next
     }
     best_model <- readRDS(path)
-    try(best_model$unmarshal(), silent = TRUE)
+    try(best_model$unmarshal(), silent = TRUE)  # unmarshal MLP tensors if needed
     best_model$train(task_train)
   }
 
@@ -898,14 +1172,25 @@ for (method in names(methods)) {
   pred_tab$match <- ifelse(pred_tab$truth == pred_tab$response, "TRUE", "FALSE")
   print(pred_tab %>% count(match) %>% mutate(ratio = round(n / sum(n), 2L)))
 
+  # assign() creates objects named e.g. "ranger_test_predict" and "ranger_pred_df"
+  # in this chunk's environment. cfmdbench_gather_pred_tabs() and
+  # cfmdbench_gather_pred_performance() (below) discover them automatically via
+  # ls(pattern = ...) so we don't need to maintain an explicit list.
   assign(paste(method, "test", "predict", sep = "_"), pred_tab)
   assign(paste(method, "pred", "df",      sep = "_"),
          pred$score(measures = lapply(bmr_measures, mlr3::msr)))
 }
 
+# cfmdbench_gather_pred_performance() (R/cfmdbench_scoring_helpers.R):
+#   Collects all <method>_pred_df objects from this environment, applies the
+#   same column renaming as cfmdbench_format_bench_df(), and optionally
+#   restricts to the same columns as bench_df so both tables align for comparison.
 pred_df <- cfmdbench_gather_pred_performance(env = environment(), bench_df = bench_df)
 print(pred_df)
 
+# cfmdbench_gather_pred_tabs() (R/cfmdbench_scoring_helpers.R):
+#   Collects all <method>_test_predict data.frames and binds them into a single
+#   long data.frame with a `method` column — convenient for faceted ggplot comparisons.
 pred_tabs <- cfmdbench_gather_pred_tabs(env = environment())
 plot_df   <- pred_tabs %>%
   mutate(truth = factor(truth, levels = task_test$class_names),
@@ -936,6 +1221,9 @@ ggplot(plot_df, aes(x = truth, y = pct, fill = match)) +
 #### Performance Comparison
 
 ```{r performance_comparison, echo=FALSE, message=FALSE, warning=FALSE}
+# Dumbbell plots comparing CV benchmark scores (train folds) vs held-out test
+# scores. The gap between the two points indicates overfitting: a large gap
+# means the model performs well on training data but generalises less well.
 metric_cols <- setdiff(names(bench_df), c("method", "learner_id"))
 
 bench_long2 <- bench_df %>%
@@ -985,8 +1273,14 @@ ggplot(dumbbell_df, aes(y = method, group = metric)) +
 #### Feature Importance
 
 ```{r importance, echo=FALSE, message=FALSE, warning=FALSE}
+# SHAP computation + plots.
+# We use best_model_id (set in the benchmark chunk as the learner with highest
+# balanced accuracy). shap_n_samples (cfg$visualisation$shap_n_samples,
+# default 100) controls how many background samples are used.
 method <- best_model_id
 
+# Strip the long NCBI-style lineage prefix (e.g. "k__Bacteria|p__...|s__X_Y")
+# down to just the species or strain name for readable plot labels.
 parse_taxon_name <- function(name) {
   parsed <- stringr::str_extract(name, "(?<=_s__).*")
   stringr::str_replace_all(parsed, "_t__", "_")
@@ -1000,26 +1294,46 @@ original_names   <- colnames(temp_tab)
 simplified_names <- vapply(original_names, parse_taxon_name, FUN.VALUE = character(1L))
 name_mapping     <- setNames(simplified_names, original_names)
 
-imodel    <- get(paste(method, "tuned", "learner", sep = "_"),
-                 envir = .GlobalEnv)
+# Load the model: prefer the in-memory trained_learners list (available when
+# this chunk runs in the same session as the train chunk). Fall back to the
+# saved RDS file if running in a fresh session.
+imodel <- if (!is.null(trained_learners[[method]])) {
+  trained_learners[[method]]
+} else {
+  readRDS(file.path(save_dir, paste0(method, "_tuned_learner.rds")))
+}
 
+# iml::Predictor wraps any mlr3 learner into a model-agnostic interface.
+# type = "prob" returns class probabilities so SHAP can be computed per class.
 temp_pred <- iml::Predictor$new(model = imodel, data = temp_tab,
                                  y = temp_targ, type = "prob")
 
+# MLP and TabPFN are not thread-safe in multisession (Python/torch context
+# cannot be forked across workers), so use sequential for those methods.
 future::plan(future::sequential)
 if (!method %in% c("mlp", "tabpfn"))
   future::plan(future::multisession, workers = num_threads)
 
+# Subsample background dataset to shap_n_samples (cfg$visualisation$shap_n_samples).
+# Computing SHAP for every training sample would be prohibitively slow.
 n_samp <- min(shap_n_samples, nrow(temp_tab))
 idx    <- sample.int(nrow(temp_tab), n_samp)
 temp_small <- temp_tab[idx, , drop = FALSE]
 
+# Compute SHAP values for each sampled observation. iml::Shapley computes
+# exact Shapley values by marginalising over all feature orderings using the
+# background dataset. Each call returns a data.frame with phi (SHAP value)
+# per feature per class.
 shap_list <- lapply(seq_len(nrow(temp_small)), function(i) {
   s <- iml::Shapley$new(temp_pred, x.interest = temp_small[i, , drop = FALSE])
   dplyr::mutate(s$results, sample_id = idx[i])
 })
 shap_all <- dplyr::bind_rows(shap_list)
 
+# Aggregate: mean absolute SHAP across samples gives a global feature importance
+# score. Higher = more influential for the model's predictions on average.
+# shap_n_features (cfg$visualisation$shap_n_features, default 10) controls
+# how many top features are shown in the plots.
 shap_agg <- shap_all %>%
   dplyr::group_by(feature) %>%
   dplyr::summarise(mean_abs_phi = mean(abs(phi)), .groups = "drop") %>%
@@ -1027,15 +1341,8 @@ shap_agg <- shap_all %>%
   dplyr::arrange(desc(mean_abs_phi)) %>%
   dplyr::slice_head(n = shap_n_features)
 
-ggplot(shap_agg, aes(x = reorder(feature_pretty, mean_abs_phi), y = mean_abs_phi)) +
-  geom_col(fill = "royalblue3") + coord_flip() +
-  labs(title = paste("Top", shap_n_features, "features by mean SHAP"),
-       subtitle = paste(n_samp, "samples used"),
-       x = "Feature (taxon)", y = "Mean |SHAP|") +
-  theme_minimal() +
-  theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
-        plot.title = element_text(size = 18))
-
+# Per-class aggregation used by the directional plot below.
+# Positive phi = feature increases P(that class); negative = decreases.
 class_contrib <- shap_all %>%
   dplyr::group_by(feature, class) %>%
   dplyr::summarise(mean_phi = mean(phi), mean_abs_phi = mean(abs(phi)),
@@ -1047,13 +1354,23 @@ class_contrib <- shap_all %>%
 classes <- sort(unique(class_contrib$class))
 
 if (length(classes) == 2L) {
+  # Binary: show SHAP for the reference class (first alphabetically).
+  # Positive mean_phi → feature increases P(reference class).
+  # Negative mean_phi → feature decreases P(reference class).
+  # The direction label is created as a character column so scale_fill_manual
+  # can match it by name directly, avoiding the unreliable positional-label
+  # behaviour that occurs when fill is a bare logical (TRUE/FALSE).
   ref <- classes[1L]
-  ggplot(class_contrib %>% dplyr::filter(class == ref),
+  ggplot(class_contrib %>%
+           dplyr::filter(class == ref) %>%
+           dplyr::mutate(direction = ifelse(mean_phi > 0,
+                                            "Increases P(ref)",
+                                            "Decreases P(ref)")),
          aes(x = reorder(feature_pretty, mean_phi), y = mean_phi,
-             fill = mean_phi > 0)) +
+             fill = direction)) +
     geom_col() + coord_flip() +
-    scale_fill_manual(values = c("TRUE" = "#1f78b4", "FALSE" = "#e31a1c"),
-                      labels = c("Decreases P(ref)", "Increases P(ref)")) +
+    scale_fill_manual(values = c("Increases P(ref)" = "#1f78b4",
+                                 "Decreases P(ref)" = "#e31a1c")) +
     geom_hline(yintercept = 0, linetype = "dashed") +
     labs(title = paste("Class-specific SHAP (reference:", ref, ")"),
          subtitle = paste(n_samp, "samples,", shap_n_features, "features"),
@@ -1062,16 +1379,30 @@ if (length(classes) == 2L) {
     theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
           plot.title = element_text(size = 18))
 } else {
-  ggplot(class_contrib, aes(x = reorder(feature_pretty, mean_abs_phi),
-                             y = mean_phi, fill = class)) +
-    geom_col(position = "dodge") + coord_flip() +
-    scale_fill_viridis_d(option = "turbo") +
-    geom_hline(yintercept = 0, linetype = "dashed") +
+  # Multi-class: one facet panel per class, fill by direction.
+  # Dodging many classes in a single panel is unreadable; faceting keeps each
+  # class legible and uses the same blue/red direction convention as the binary
+  # plot above (blue = increases P(class), red = decreases P(class)).
+  ggplot(class_contrib %>%
+           dplyr::mutate(direction = ifelse(mean_phi > 0,
+                                            "Increases P(class)",
+                                            "Decreases P(class)")),
+         aes(x = reorder(feature_pretty, mean_abs_phi),
+             y = mean_phi, fill = direction)) +
+    geom_col() + coord_flip() +
+    scale_fill_manual(values = c("Increases P(class)" = "#1f78b4",
+                                 "Decreases P(class)" = "#e31a1c")) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    facet_wrap(~ class, scales = "free_x") +
     labs(title = "Class-specific SHAP contributions",
          subtitle = paste(n_samp, "samples,", shap_n_features, "features"),
-         x = "Feature (taxon)", y = "Mean SHAP value", fill = "Class") +
+         x = "Feature (taxon)", y = "Mean SHAP value", fill = "Effect") +
     theme_minimal() +
-    theme(axis.text = element_text(size = 14), axis.title = element_text(size = 16),
-          plot.title = element_text(size = 18))
+    theme(axis.text.y  = element_text(size = 12),
+          axis.text.x  = element_text(size = 10),
+          axis.title   = element_text(size = 14),
+          plot.title   = element_text(size = 18),
+          strip.text   = element_text(size = 12, face = "bold"),
+          legend.position = "bottom")
 }
 ```

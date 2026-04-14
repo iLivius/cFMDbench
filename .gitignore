@@ -47,3 +47,15 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Machine-specific IDE settings (use .vscode/settings.json.example as template)
+.vscode/settings.json
+
+# Machine-specific R profile
+.Rprofile
+
+# Saved learner objects (large binary outputs)
+*_saved_learners/
+
+# Benchmark cache (taxonomic profiles + manifests)
+cache_cFMD/
