@@ -1,0 +1,55 @@
+# cFMDbench configuration
+# All user-tunable parameters are gathered here.
+# Missing keys fall back to built-in defaults in R/cfmdbench_config_helpers.R.
+
+# ── Method selection ───────────────────────────────────────────────────────────
+methods:
+  pick: ["ranger", "xgboost"]
+  # Valid entries (single string or list):
+  #   glmnet, kknn, lda, mlp, naive_bayes, ranger, svm, tabpfn, xgboost
+  #   — or — "all"
+
+# ── Execution ──────────────────────────────────────────────────────────────────
+execution:
+  seed: 42
+  kfold: 10
+  repeats: 5               # used by repeated k-fold on small datasets
+  num_threads: null        # null = parallel::detectCores()
+  future_globals_max_size_gb: 2
+  term_min: 20             # max tuning runtime per method (minutes)
+  fast_tuning: true        # Hyperband / successive-halving; set false for grid search
+  learner_fallback: false  # wrap final learner in callr + featureless fallback
+
+# ── Dataset ────────────────────────────────────────────────────────────────────
+dataset:
+  id: "cFMD"
+  version: "v1.3.0"        # pinned Git ref used for download and directory naming
+  target: "category"       # column to predict: category | type | subtype
+  run_date: ""             # "" = today; "2025-12-25" to reuse an existing save_dir
+
+# ── Data source (GitHub) ───────────────────────────────────────────────────────
+data_source:
+  repo: "SegataLab/cFMD"
+  path: "cFMD_data"
+  completeness_threshold: 99   # minimum per-sample taxa sum (percent)
+  api_batch_size: 10           # projects fetched per GitHub API batch
+
+# ── Preprocessing ──────────────────────────────────────────────────────────────
+preprocessing:
+  min_samples_per_class: 25
+  samples_to_keep: 1           # proportion of class samples to keep (1 = all)
+  smote: ""                    # "smote" | "blsmote" | "adasyn" | "none" | "" (auto)
+  filtering: "minimal"         # false | "minimal" | "varcor" | "infogain"
+  selecting: true              # run recursive feature elimination before training
+
+# ── Feature selection ──────────────────────────────────────────────────────────
+feature_selection:
+  num_col: 100   # target n_features = 10 when ncol >= this; 2 otherwise
+  num_row: 100   # use "simple" (single-learner RFE) when nrow > this; "ensemble" otherwise
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+visualisation:
+  downsample_n: 1000      # max samples for PCA / t-SNE scatter plots
+  prevalence_min: 0.05    # minimum taxon prevalence kept for ordination
+  shap_n_samples: 100     # samples used to compute SHAP values
+  shap_n_features: 10     # top features shown in SHAP plots
