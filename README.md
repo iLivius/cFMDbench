@@ -4,12 +4,11 @@
 
 [![R](https://img.shields.io/badge/R-276DC3?style=for-the-badge&logo=r&logoColor=white)](https://www.r-project.org/)
 [![mlr3](https://img.shields.io/badge/mlr3-0A0A0A?style=for-the-badge)](https://mlr3.mlr-org.com/)
-[![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![scikit-learn](https://img.shields.io/badge/scikit--learn-F7931E?style=for-the-badge&logo=scikitlearn&logoColor=white)](https://scikit-learn.org/)
 [![Torch](https://img.shields.io/badge/Torch-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Conda](https://img.shields.io/badge/Conda-44A833?style=for-the-badge&logo=anaconda&logoColor=white)](https://docs.conda.io/)
 [![Quarto](https://img.shields.io/badge/Quarto-3D5A80?style=for-the-badge&logo=quarto&logoColor=white)](https://quarto.org/)
 [![Positron](https://img.shields.io/badge/Positron-3C6E71?style=for-the-badge&logo=posit&logoColor=white)](https://posit.co/positron/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19607623.svg)](https://doi.org/10.5281/zenodo.19607623)
 
 ## Rationale
 
@@ -460,6 +459,14 @@ Below is a compact description of every notebook chunk and its role in the analy
 - [MASTER](https://www.master-h2020.eu/) — Microbiome Applications for Sustainable food systems through Technologies and Enterprise.
 - [DOMINO](https://www.domino-euproject.eu/) — Harnessing the potential of fermentation for healthy and sustainable foods.
 - [FlavourFerm](https://www.flavourferm.eu/) — Unleashing the flavour potential of plant-based foods.
+
+---
   
 ## Citation
-- Carlino, Niccolò et al. "Unexplored microbial diversity from 2,500 food metagenomes and links with the human microbiome." Cell vol. 187,20 (2024): 5775-5795.e15. doi:10.1016/j.cell.2024.07.039
+If you use cFMDbench, please cite:
+
+> Antonielli, L. (2026). cFMDbench: Benchmarking ML classifiers on food metagenomic profiles with mlr3. Zenodo. https://doi.org/10.5281/zenodo.19607623
+
+Please also cite the cFMD resource:
+
+> Carlino, N., et al. (2024). Unexplored microbial diversity from 2,500 food metagenomes and links with the human microbiome. *Cell*, *187*(20), 5775–5795.e15. https://doi.org/10.1016/j.cell.2024.07.039
