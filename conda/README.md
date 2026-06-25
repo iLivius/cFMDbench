@@ -7,8 +7,9 @@ bootstrap script.
   Quarto notebook from Positron, VS Code, RStudio, or the terminal.
 - `cfmdbench-tabpfn-gpu.yml` — the Python environment used only when the
   workflow runs `tabpfn` through `reticulate`.
-- `install_r_packages.R` — installs all CRAN, conda-forge, and GitHub R
-  packages into the active Conda environment.
+- `install_r_packages.R` — installs/checks the default R package set in the
+  active Conda environment. Optional learner bridges are installed only when
+  explicitly requested.
 
 ## Recommended setup
 
@@ -20,15 +21,18 @@ conda activate cfmdbench-r
 Rscript conda/install_r_packages.R
 ```
 
-If you plan to use the `mlp` learner, also install the R torch backend:
+The default command is enough for the `ranger` and `xgboost` workflow. If you
+plan to use the `mlp` learner, also install the R torch backend:
 
 ```bash
 INSTALL_R_TORCH=1 Rscript conda/install_r_packages.R
 ```
 
-Create the TabPFN GPU environment only if you plan to use `tabpfn`:
+Create the TabPFN GPU environment and install the R learner bridge only if you
+plan to use `tabpfn`:
 
 ```bash
+INSTALL_TABPFN_R=1 Rscript conda/install_r_packages.R
 conda env create -f conda/cfmdbench-tabpfn-gpu.yml
 ```
 
@@ -52,6 +56,10 @@ GITHUB_TOKEN=ghp_xxx
 - The R environment is the main environment for this repository.
 - The TabPFN environment is optional. Methods such as `ranger` and `xgboost`
   work without it.
+- `mlr3extralearners`, R `torch`, Java/Weka, and h2o-related learner
+  dependencies are not part of the default install path.
+- Run `install_r_packages.R` from `cfmdbench-r`, not Conda `base`; the script
+  exits early if `base` is active.
 - GPU support is strongly recommended for TabPFN; repeated resampling on CPU
   is practical but much slower.
 - The old `envs/` directory (pre-refactor) contained a fully-pinned monolithic
@@ -85,11 +93,15 @@ alias cfmdbench='conda activate cfmdbench-r && rstudio /path/to/cFMDbench/cFMDbe
 
 ## VS Code users (Linux)
 
-The VS Code R extension spawns R as a direct subprocess without activating the
-Conda environment first, so `.libPaths()` may point to the system R library
+When VS Code runs on a local notebook but the project lives on a server, use
+Remote SSH and open the remote project folder. Commands such as `conda activate`,
+`Rscript conda/install_r_packages.R`, and `quarto render` should run in the
+remote terminal.
+
+The VS Code R extension can spawn R as a direct subprocess without activating
+the Conda environment first, so `.libPaths()` may point to the system R library
 instead of the Conda env library. The project `.Rprofile` corrects this
-automatically when R starts in the project root (it reads `CONDA_PREFIX` from
-the environment).
+automatically when R starts in the project root and `CONDA_PREFIX` is set.
 
 A workspace settings template is provided at `.vscode/settings.json.example`.
 Copy it and fill in your actual Conda path:

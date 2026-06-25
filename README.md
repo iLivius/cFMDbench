@@ -50,25 +50,34 @@ cFMDbench/
 
 ### 1) R environment
 
-Create the R Conda environment and pre-install the heaviest R packages. Remaining packages are auto-installed on first run via `pacman`.
+Create the R Conda environment and install the default R package set. This is enough for the default `ranger` + `xgboost` workflow.
+
+The installer uses conda-forge first for packages that need system libraries, which avoids common Ubuntu linker problems. It also refuses Conda `base`, installs only required packages, and leaves optional learner backends off by default.
 
 ```bash
 # Create and activate the R environment
 conda env create -f conda/cfmdbench-r.yml
 conda activate cfmdbench-r
 
-# Pre-install core R packages (skips CRAN prompts during the first notebook run)
+# Install/check default R packages
 Rscript conda/install_r_packages.R
 ```
 
-- *On first run, `analysis/cFMDbench.qmd` uses `pacman` to automatically install any remaining missing R packages.*
+- *The notebook checks for required packages but does not install them during rendering.*
 - *See `conda/README.md` for RStudio, Positron, and VS Code setup instructions.*
+
+If you plan to use the `mlp` learner, install the optional R torch backend:
+
+```bash
+INSTALL_R_TORCH=1 Rscript conda/install_r_packages.R
+```
 
 ### 2) TabPFN environment (optional)
 
-[TabPFN](https://github.com/PriorLabs/TabPFN) runs through `reticulate` from R. It requires a separate Python Conda environment and is only needed if `tabpfn` is listed in `config.yaml` under `methods.pick`.
+[TabPFN](https://github.com/PriorLabs/TabPFN) runs through `reticulate` from R. It requires a separate Python Conda environment and the optional R learner bridge. Install these only if `tabpfn` is listed in `config.yaml` under `methods.pick`.
 
 ```bash
+INSTALL_TABPFN_R=1 Rscript conda/install_r_packages.R
 conda env create -f conda/cfmdbench-tabpfn-gpu.yml
 ```
 
@@ -117,8 +126,8 @@ Credentials and paths are **not** stored in `config.yaml`. Define them in `~/.Re
 # Required scope: none (public repo read is enough without any scope selected)
 GITHUB_TOKEN=ghp_your_personal_access_token_here
 
-# Optional: override the working directory (defaults to the repo root)
-CFMD_BENCH_WORKDIR=/absolute/path/to/your/workdir
+# Optional: force the project root when rendering from outside the repo
+CFMD_BENCH_WORKDIR=/absolute/path/to/cFMDbench
 
 # Required only when running TabPFN:
 # Create HF token at: huggingface.co/settings/tokens → "New token" → Read access
@@ -134,7 +143,21 @@ TABPFN_CONDA_ROOT=/absolute/path/to/miniconda3
 
 ## Run
 
-Recommended usage is interactive — run chunks one at a time to inspect each step.
+Run cFMDbench on the server where the data, Conda environments, and R packages are installed. If you connect from a local notebook with VS Code, use **Remote SSH** and run commands in the remote terminal, not in a local terminal.
+
+Recommended analysis usage is interactive — run chunks one at a time to inspect each step. For a full non-interactive render from the server terminal:
+
+```bash
+cd /media/scratch/cFMDbench
+conda activate cfmdbench-r
+quarto render analysis/cFMDbench.qmd
+```
+
+If Quarto is launched from another directory, set the project root explicitly:
+
+```bash
+CFMD_BENCH_WORKDIR=/media/scratch/cFMDbench quarto render analysis/cFMDbench.qmd
+```
 
 ### RStudio (recommended)
 
@@ -149,7 +172,7 @@ Open `analysis/cFMDbench.qmd` and run chunks interactively. The `.Rproj` file se
 
 ### Positron / VS Code
 
-See `conda/README.md` for IDE-specific setup. Select the R interpreter from the `cfmdbench-r` Conda environment.
+See `conda/README.md` for IDE-specific setup. With VS Code on a local notebook, connect to the server with Remote SSH, open `/media/scratch/cFMDbench`, and select the R interpreter from the remote `cfmdbench-r` Conda environment.
 
 ### Customise a run
 
@@ -161,7 +184,7 @@ See `conda/README.md` for IDE-specific setup. Select the R interpreter from the 
 
 ## Dependency and environment management
 
-This section is a reference for keeping the environments healthy over time — useful after months away from the project, on a new machine, or when packages have drifted out of sync.
+This section summarizes routine environment checks, updates, and recovery steps.
 
 ### Verify the setup before running
 
@@ -176,8 +199,8 @@ quarto --version       # should be available
 # Confirm the GitHub token is loaded and has sufficient rate limit
 Rscript -e "cat('GITHUB_TOKEN set:', nzchar(Sys.getenv('GITHUB_TOKEN')), '\n')"
 
-# Verify mlr3 and key dependencies are installed
-Rscript -e "library(mlr3); library(mlr3learners); library(mlr3pipelines); cat('mlr3 OK\n')"
+# Verify mlr3, Conda-linked native deps, and default learners
+Rscript -e "library(nanonext); library(mirai); library(mlr3); library(mlr3learners); library(mlr3pipelines); library(ranger); library(xgboost); cat('default R stack OK\n')"
 
 # If TabPFN is selected, verify the Python environment
 Rscript -e "
@@ -190,23 +213,22 @@ Rscript -e "
 
 ### Update R packages
 
-R packages installed via `install_r_packages.R` and `pacman` do **not** update automatically. Run this periodically to pick up bug fixes and compatibility patches:
+R packages installed via Conda and `install_r_packages.R` do **not** update automatically. Run this periodically to pick up bug fixes and compatibility patches:
 
 ```bash
 conda activate cfmdbench-r
+
+# Update packages already managed by conda-forge
+conda update -n cfmdbench-r -c conda-forge --all
+
+# Re-check/install remaining CRAN packages without optional Suggests
+Rscript conda/install_r_packages.R
+
+# If using TabPFN, update the optional mlr3extralearners bridge too.
+INSTALL_TABPFN_R=1 Rscript conda/install_r_packages.R
 ```
 
-```r
-# Update all CRAN packages in the conda env
-update.packages(ask = FALSE, repos = "https://cloud.r-project.org")
-
-# Update mlr3extralearners separately — it is GitHub-only and not on CRAN.
-# "@*release" always fetches the latest tagged release.
-remotes::install_github("mlr-org/mlr3extralearners@*release",
-                        upgrade = "never", dependencies = TRUE)
-```
-
-> **Note on mlr3 ecosystem updates:** mlr3 packages have strict inter-version dependencies. Update them together (mlr3, mlr3learners, mlr3pipelines, mlr3tuning, mlr3hyperband, mlr3fselect, mlr3filters, mlr3extralearners) rather than one at a time, or a version mismatch will produce cryptic `object not found` errors.
+> **Note on mlr3 ecosystem updates:** mlr3 packages have strict inter-version dependencies. Update them together (mlr3, mlr3learners, mlr3pipelines, mlr3tuning, mlr3hyperband, mlr3fselect, mlr3filters, and optionally mlr3extralearners) rather than one at a time, or a version mismatch will produce cryptic `object not found` errors.
 
 If R torch needs to be reinstalled (e.g. after a CUDA driver update):
 
@@ -233,7 +255,7 @@ The `conda/cfmdbench-tabpfn-gpu.yml` file pins `tabpfn==6.0.6` and `pytorch=2.9.
 conda env export -n cfmdbench-tabpfn-gpu > conda/cfmdbench-tabpfn-gpu-pinned.yml
 ```
 
-> **TabPFN model weights** are downloaded from HuggingFace on first use and cached in `~/.cache/tabpfn/` (typically several GB). If you need to force a re-download (e.g. after a major version bump), delete that directory.
+> **TabPFN model weights** are downloaded from HuggingFace on first use and cached in `~/.cache/tabpfn/`. If you need to force a re-download (e.g. after a major version bump), delete that directory.
 
 ### Recreate environments from scratch
 
@@ -246,6 +268,7 @@ conda env create -f conda/cfmdbench-r.yml
 conda activate cfmdbench-r
 Rscript conda/install_r_packages.R          # base packages
 # INSTALL_R_TORCH=1 Rscript conda/install_r_packages.R  # add this for MLP
+# INSTALL_TABPFN_R=1 Rscript conda/install_r_packages.R # add this for TabPFN
 
 # Remove and recreate the TabPFN environment (if needed)
 conda env remove -n cfmdbench-tabpfn-gpu
@@ -304,23 +327,7 @@ cache_cFMD/
 - **To rerun a specific method** without redoing others: delete `<method>_tuned_instance.rds` and `<method>_tuned_learner.rds` for that method only. The training loop skips methods whose instance file shows `is_terminated = TRUE`.
 - **To redo all training** from scratch for a run: delete the entire save directory.
 - **To force a full data re-download**: delete `cache_cFMD/<version>/` or just the `manifest.rds` file inside it (the manifest holds the SHA index; without it all files are re-fetched).
-- **Disk space**: each `_tuned_instance.rds` can be several hundred MB for methods with large archives (SVM, ranger). Delete instance files after a run if disk space is a concern — the learner `.rds` files are all you need for predictions.
-
-### Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `'lrn' is not an exported object from 'namespace:mlr3learners'` | mlr3 packages are out of sync | Update all mlr3 packages together; `lrn()` lives in `mlr3`, not `mlr3learners` |
-| `'tnr' is not an exported object from 'namespace:mlr3hyperband'` | Same version drift | `tnr()` lives in `mlr3tuning`; mlr3hyperband registers its tuners there at load time |
-| `htop` segfaults in RStudio terminal | `LD_LIBRARY_PATH` contamination from conda | Use a separate system terminal (outside conda) for monitoring tools |
-| Torch download prompt appears unexpectedly | `cfmdbench_build_learners()` called without `methods` arg | Pass `methods = names(methods)` so MLP construction is skipped when not selected |
-| TabPFN and MLP both fail | Both selected in `config.yaml` | Remove one — they cannot run in the same R session (CUDA context conflict) |
-| `HF_TOKEN not set` error | TabPFN selected but token missing | Add `HF_TOKEN=hf_...` to `~/.Renviron` and restart R |
-| `GITHUB_TOKEN not set` error | Token missing or `.Renviron` not loaded | Check `Sys.getenv("GITHUB_TOKEN")`; restart R session to reload `.Renviron` |
-| Method skipped with "already finished" even after a code change | Old `*_tuned_instance.rds` has `is_terminated = TRUE` | Delete the instance file for that method to force re-tuning |
-| Feature importance fails with `object not found` for `<method>_tuned_learner` | Running in a fresh session without the `trained_learners` list | The importance chunk falls back to reading the `.rds` file from `save_dir`; ensure `save_dir` variable points to the right directory |
-| `cannot change value of locked binding for '.torch_can_load'` | `install_torch()` ran while `torch` was already loaded (namespace locked) | The binaries downloaded successfully. Just restart R (Session → Restart R) and re-run — do **not** call `install_torch()` again |
-| `reticulate::use_condaenv` fails | `TABPFN_CONDA_ROOT` path is wrong | Set `TABPFN_CONDA_ROOT` to the output of `conda info --base` |
+- **Disk space**: saved learner files are usually small. Tuning instance files store the search archive and can be larger; delete them after a run if disk space matters — the learner `.rds` files are all you need for predictions.
 
 ---
 
@@ -328,9 +335,9 @@ cache_cFMD/
 
 Below is a compact description of every notebook chunk and its role in the analysis.
 
-- **Setup** — Locates the project root via a cascade: `CFMD_BENCH_WORKDIR` env var → knitr `root.dir` → walk up looking for `config.yaml` → fallback to `getwd()`. Sets `knitr` root so all subsequent `file.path()` calls are anchored correctly.
+- **Setup** — Locates the project root via `CFMD_BENCH_WORKDIR` or by walking upward from knitr `root.dir`, the current input path, and `getwd()` until it finds `config.yaml`. Sets `knitr` root so all subsequent `file.path()` calls are anchored correctly.
 
-- **Methods and Libraries** — Loads `config.yaml` via `cfmdbench_load_config()`, resolves the selected methods with `cfmdbench_resolve_methods()`, loads R packages (auto-installing missing ones via `pacman`), sources the four helper scripts, and configures optional backends (TabPFN conda env or R torch) via `cfmdbench_setup_backends()`.
+- **Methods and Libraries** — Loads `config.yaml` via `cfmdbench_load_config()`, resolves the selected methods with `cfmdbench_resolve_methods()`, checks that the required R packages are installed, sources the four helper scripts, and configures optional backends (TabPFN conda env or R torch) via `cfmdbench_setup_backends()`.
 
 - **Set Parameters** — Unpacks every `cfg$...` value into named variables used throughout the notebook. Creates the `save_dir` folder (`<date>_<dataset>_<version>_saved_learners/`) and sets the `future` globals size limit for parallelisation.
 

@@ -47,7 +47,9 @@ cfmdbench_build_learners <- function(seed = 42L, kfold = 10L, methods = NULL) {
     svm         = mlr3::lrn("classif.svm",
                              type = "C-classification",
                              predict_type = "prob"),
-    xgboost     = mlr3::lrn("classif.xgboost",     predict_type = "prob")
+    xgboost     = mlr3::lrn("classif.xgboost",
+                             booster = "gbtree",
+                             predict_type = "prob")
   )
 
   # MLP (mlr3torch) — only when explicitly selected.
@@ -306,7 +308,9 @@ cfmdbench_get_search_space <- function(method, fast_tuning, num_feat, num_obs,
       xgboost = {
         if (!is.null(base_learner))
           base_learner$param_set$set_values(
-            eval_metric = eval_metrics, early_stopping_rounds = 10L)
+            booster = "gbtree",
+            eval_metric = eval_metrics,
+            early_stopping_rounds = 10L)
         list(
           classif.xgboost.nrounds            = p_int(10L, 1000L, tags = "budget"),
           classif.xgboost.eta                = p_dbl(1e-4, 1, logscale = TRUE),   # learning rate
@@ -394,7 +398,9 @@ cfmdbench_get_search_space <- function(method, fast_tuning, num_feat, num_obs,
       xgboost = {
         if (!is.null(base_learner))
           base_learner$param_set$set_values(
-            eval_metric = eval_metrics, early_stopping_rounds = 10L)
+            booster = "gbtree",
+            eval_metric = eval_metrics,
+            early_stopping_rounds = 10L)
         list(
           classif.xgboost.nrounds           = p_int(10L, 1000L, tags = "budget"),
           classif.xgboost.eta               = p_dbl(1e-4, 1, logscale = TRUE),
@@ -694,8 +700,24 @@ cfmdbench_train_methods <- function(methods, base_learners, preprocessing_pipe,
       next
     }
     # Load partial instance for resumption if tuning was interrupted mid-run.
-    if (file.exists(instance_file)) {
+    # Older mlr3learners/paradox versions allowed xgboost tree-only parameters
+    # without an explicit booster. Newer versions require booster = "gbtree";
+    # stale partial instances without that fixed value must be recreated.
+    resume_instance <- file.exists(instance_file)
+    if (resume_instance) {
       instance <- readRDS(instance_file)
+      if (method == "xgboost") {
+        saved_booster <- tryCatch(
+          instance$objective$learner$param_set$values$classif.xgboost.booster,
+          error = function(e) NULL
+        )
+        if (!identical(saved_booster, "gbtree")) {
+          message("Ignoring stale xgboost tuning instance without booster = 'gbtree': ",
+                  instance_file)
+          rm(instance)
+          resume_instance <- FALSE
+        }
+      }
     }
 
     base_learner      <- base_learners[[method]]$clone(deep = TRUE)
@@ -727,7 +749,7 @@ cfmdbench_train_methods <- function(methods, base_learners, preprocessing_pipe,
     # Only create a fresh TuningInstance if no partial instance exists on disk.
     # If a partial instance was loaded above, reuse it so the tuner continues
     # from where it stopped rather than restarting from scratch.
-    if (!file.exists(instance_file)) {
+    if (!resume_instance) {
       instance <- mlr3tuning::ti(
         task_train, final_learner, tuning_resampling,
         mlr3::msrs(train_measures),

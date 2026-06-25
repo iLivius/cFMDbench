@@ -6,7 +6,12 @@ dependencies:
   - r-base=4.5
   - r-essentials
   - r-irkernel
-  - r-pacman
+  - r-callr
+  - r-data.table
+  - r-e1071
+  - r-future
+  - r-future.apply
+  - r-glmnet
   - r-remotes
   - r-reticulate
   - r-yaml
@@ -14,7 +19,25 @@ dependencies:
   - r-jsonlite
   - r-igraph
   - r-kknn
+  - r-lgr
+  - r-mass
+  - r-mirai
+  - r-mlr3
+  - r-mlr3filters
+  - r-mlr3fselect
+  - r-mlr3hyperband
+  - r-mlr3learners
+  - r-mlr3pipelines
+  - r-mlr3tuning
+  - r-mlr3tuningspaces
+  - r-mlr3viz
+  - r-nanonext
+  - r-paradox
+  - r-progressr
+  - r-ranger
+  - r-rpart
   - r-smotefamily
+  - r-xgboost
   - quarto
   - pandoc
   - git
@@ -32,3 +55,4 @@ dependencies:
   - harfbuzz
   - fribidi
   - icu
+  - mbedtls

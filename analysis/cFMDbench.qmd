@@ -15,36 +15,41 @@ editor_options:
 ```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
 # Locate the project root so every subsequent file.path() call is anchored to
 # the repo directory regardless of where the qmd is opened or rendered.
-# The cascade is: CFMD_BENCH_WORKDIR env var → knitr root.dir → walk up the
-# directory tree looking for config.yaml → fall back to getwd().
+# The cascade is: CFMD_BENCH_WORKDIR env var → knitr root.dir/current input/getwd()
+# → walk up the directory tree looking for config.yaml.
 # The env var override is useful when rendering headlessly (e.g. CI).
 find_project_root <- function() {
   env_root <- Sys.getenv("CFMD_BENCH_WORKDIR", unset = "")
-  if (nzchar(env_root) && dir.exists(env_root)) return(normalizePath(env_root))
-
-  knitr_root <- tryCatch(
-    normalizePath(knitr::opts_knit$get("root.dir"), mustWork = FALSE),
-    error = function(e) ""
-  )
-  if (nzchar(knitr_root) && dir.exists(knitr_root)) return(knitr_root)
-
-  # Walk up from the qmd file location until we find config.yaml (max 10 levels).
-  start <- tryCatch(
-    dirname(normalizePath(knitr::current_input(), mustWork = FALSE)),
-    error = function(e) getwd()
-  )
-  d <- start
-  for (i in seq_len(10L)) {
-    if (file.exists(file.path(d, "config.yaml"))) return(d)
-    parent <- dirname(d)
-    if (parent == d) break
-    d <- parent
+  if (nzchar(env_root) && dir.exists(env_root)) {
+    env_root <- normalizePath(env_root)
+    if (file.exists(file.path(env_root, "config.yaml"))) return(env_root)
+    stop("CFMD_BENCH_WORKDIR does not point to the cFMDbench root: ", env_root,
+         call. = FALSE)
   }
-  getwd()
+
+  candidates <- c(
+    tryCatch(knitr::opts_knit$get("root.dir"), error = function(e) ""),
+    tryCatch(dirname(normalizePath(knitr::current_input(), mustWork = FALSE)),
+             error = function(e) ""),
+    getwd()
+  )
+
+  # Walk up from each candidate until we find config.yaml (max 10 levels).
+  for (start in candidates[nzchar(candidates)]) {
+    d <- normalizePath(start, mustWork = FALSE)
+    for (i in seq_len(10L)) {
+      if (file.exists(file.path(d, "config.yaml"))) return(d)
+      parent <- dirname(d)
+      if (parent == d) break
+      d <- parent
+    }
+  }
+
+  stop("Could not locate cFMDbench project root. Run from the repo root or set ",
+       "CFMD_BENCH_WORKDIR=/absolute/path/to/cFMDbench.", call. = FALSE)
 }
 
 root <- find_project_root()
-setwd(root)
 knitr::opts_knit$set(root.dir = root)
 ```
 
@@ -75,43 +80,67 @@ needs_tabpfn    <- "tabpfn" %in% names(methods)
 cat("Methods selected:\n"); print(methods)
 
 # ── Package loading ────────────────────────────────────────────────────────────
-if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+# The notebook is intentionally read-only with respect to package installation.
+# Run conda/install_r_packages.R before rendering so compiled dependencies come
+# from conda-forge and optional learner backends remain explicit opt-ins.
 
 base_pkgs <- c(
-  "callr", "coin", "compositions", "conflicted", "cowplot", "data.table", "emoa",
+  "callr", "coin", "compositions", "conflicted", "cowplot", "data.table", "e1071", "emoa",
   "factoextra", "FactoMineR", "farff", "fastVoteR", "FSelectorRcpp", "future",
-  "future.apply", "httr", "iml", "jsonlite", "kknn", "magrittr",
-  "mlr3filters", "mlr3fselect", "mlr3hyperband", "mlr3learners", "mlr3oml",
+  "future.apply", "glmnet", "httr", "iml", "jsonlite", "kknn", "magrittr",
+  "MASS", "mlr3", "mlr3filters", "mlr3fselect", "mlr3hyperband", "mlr3learners",
   "mlr3pipelines", "mlr3tuning", "mlr3tuningspaces", "mlr3viz", "paradox",
-  "parallel", "patchwork", "plotly", "progressr", "ranger", "Rtsne", "scales",
+  "naivebayes", "parallel", "patchwork", "plotly", "progressr", "ranger", "rpart", "Rtsne", "scales",
   "smotefamily", "stabm", "tidyverse", "vegan", "wordcloud", "wordcloud2",
-  "yaml", "zCompositions"
+  "xgboost", "yaml", "zCompositions"
 )
 # Only load torch/reticulate when the corresponding method is actually selected,
 # to avoid triggering the torch download prompt or the conda env check.
-torch_pkgs  <- if (needs_mlr3torch) "mlr3torch"  else character()
-tabpfn_pkgs <- if (needs_tabpfn)    "reticulate" else character()
-
-# mlr3extralearners is only on GitHub (not CRAN), so it must be installed
-# separately before pacman::p_load tries to resolve it.
-if (!requireNamespace("remotes",          quietly = TRUE)) install.packages("remotes")
-if (!requireNamespace("mlr3extralearners", quietly = TRUE))
-  remotes::install_github("mlr-org/mlr3extralearners@*release",
-                           upgrade = "never", dependencies = TRUE)
+torch_pkgs  <- if (needs_mlr3torch) c("mlr3torch", "torch") else character()
+tabpfn_pkgs <- if (needs_tabpfn) c("reticulate", "mlr3extralearners") else character()
 
 pkgs <- unique(c(base_pkgs, torch_pkgs, tabpfn_pkgs))
-do.call(pacman::p_load, c(as.list(pkgs), install = TRUE))
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE,
+                              FUN.VALUE = logical(1L))]
+if (length(missing_pkgs)) {
+  hint <- c(
+    "Install the default R environment first:",
+    "  conda activate cfmdbench-r",
+    "  Rscript conda/install_r_packages.R"
+  )
+  if (any(c("mlr3torch", "torch") %in% missing_pkgs)) {
+    hint <- c(hint, "For the 'mlp' method, also run:",
+              "  INSTALL_R_TORCH=1 Rscript conda/install_r_packages.R")
+  }
+  if ("mlr3extralearners" %in% missing_pkgs) {
+    hint <- c(hint, "For the 'tabpfn' method, also run:",
+              "  INSTALL_TABPFN_R=1 Rscript conda/install_r_packages.R")
+  }
+  stop(
+    "Missing R package(s): ", paste(missing_pkgs, collapse = ", "), "\n",
+    paste(hint, collapse = "\n"),
+    call. = FALSE
+  )
+}
+
+# Load conflicted after the ordinary packages are attached. If conflicted is
+# attached earlier, package loading itself can fail on known conflicts such as
+# compositions::cor vs stats::cor.
+attach_pkgs <- setdiff(pkgs, "conflicted")
+invisible(lapply(attach_pkgs, library, character.only = TRUE))
+library(conflicted)
 
 # Resolve name collisions between mlr3/tidyverse/compositions that all export
 # common generic names. Without this, R would use whichever was loaded last,
 # which can change silently between sessions.
-conflict_prefer("select",   "dplyr")
-conflict_prefer("filter",   "dplyr")
-conflict_prefer("rename",   "dplyr")
-conflict_prefer("mutate",   "dplyr")
-conflict_prefer("first",    "dplyr")
-conflict_prefer("var",      "compositions")
-conflict_prefer("progress", "httr")
+conflicted::conflict_prefer("select",   "dplyr")
+conflicted::conflict_prefer("filter",   "dplyr")
+conflicted::conflict_prefer("rename",   "dplyr")
+conflicted::conflict_prefer("mutate",   "dplyr")
+conflicted::conflict_prefer("first",    "dplyr")
+conflicted::conflict_prefer("cor",      "stats")
+conflicted::conflict_prefer("var",      "compositions")
+conflicted::conflict_prefer("progress", "httr")
 
 # Load the three helper scripts that define all cfmdbench_* functions.
 # These must be sourced AFTER packages are loaded (they depend on mlr3, dplyr, etc.).
@@ -149,7 +178,15 @@ set.seed(seed)
 # Raise the future globals size limit to handle large objects (e.g. the full
 # dataset, preprocessing pipeline) crossing process boundaries during parallel CV.
 options(future.globals.maxSize = cfg$execution$future_globals_max_size_gb * 1024^3)
-handlers(global = TRUE)   # enable progressr progress bars globally
+
+# progressr's global handler cannot be registered from inside Quarto/knitr's
+# own calling-handler stack. Keep rendered runs quiet and only enable global
+# progress bars in a plain interactive R session.
+if (isTRUE(getOption("knitr.in.progress"))) {
+  options(progressr.enable = FALSE)
+} else if (interactive()) {
+  progressr::handlers(global = TRUE)
+}
 
 # ── Dataset settings (config.yaml → dataset section) ──────────────────────────
 ds     <- cfg$dataset$id       # dataset identifier used in file names
@@ -761,6 +798,7 @@ if (selecting) {
     fs_ranger  <- mlr3::lrn("classif.ranger",  importance = "permutation")
     fs_svm     <- mlr3::lrn("classif.svm",     type = "C-classification", kernel = "linear")
     fs_xgboost <- mlr3::lrn("classif.xgboost", nrounds = max_nrounds,
+                              booster = "gbtree",
                               early_stopping_rounds = 10L)
     mlr3::set_validate(fs_xgboost, 0.2)   # XGBoost needs a validation split for early stopping
     mlr3::set_threads(fs_ranger,  n = ceiling(num_threads / 5L))
