@@ -1,3 +1,15 @@
+> ## ⚠️ Retired — superseded by TabFlux
+>
+> This benchmark is no longer developed. It has grown into TabFlux, which classifies microbial community profiles with classic learners and TabPFN-3.5 side by side, ships as a ready-made container, and uses cFMD as its built-in case study.
+>
+> To run what this repository used to do, run TabFlux's cFMD demo, or the full seven-category run (config_cfmd_category.yaml).
+>
+> Expect lower scores from TabFlux: it holds out whole cFMD datasets when it evaluates, while this benchmark split samples at random, so a model here could partly recognise the dataset rather than the food.
+>
+> Nothing here has been deleted, and the DOI below stays valid. If you published work using this repository, that citation remains correct and resolvable — cite what you actually ran. New work should use TabFlux.
+>
+> Documentation: https://iLivius.github.io/TabFlux/ · cFMD case study: https://iLivius.github.io/TabFlux/cfmd/
+
 # cFMDbench
 
 *ML classification on cFMD taxonomic profiles with mlr3. Quarto workflow. Conda envs. For teaching and testing.*
